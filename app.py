@@ -1,0 +1,1262 @@
+import re
+import zipfile
+from io import BytesIO
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
+
+
+# =====================================================
+# PAGE CONFIGURATION
+# =====================================================
+st.set_page_config(
+    page_title="Batch Report Analyzer",
+    layout="wide",
+)
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+def normalize_space(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def empty_dataframe(columns):
+    return pd.DataFrame(columns=columns)
+
+
+def find_first(text, patterns, default=""):
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return normalize_space(match.group(1))
+    return default
+
+
+def find_section_bounds(pages, include_terms, stop_terms=None):
+    """Return pages belonging to a report section based on page headers."""
+    selected = []
+    collecting = False
+    stop_terms = stop_terms or []
+
+    for page in pages:
+        page_text = page["Text"]
+        lower = page_text.lower()
+
+        if any(term.lower() in lower for term in include_terms):
+            collecting = True
+
+        if collecting and selected and any(term.lower() in lower for term in stop_terms):
+            break
+
+        if collecting:
+            selected.append(page)
+
+    return selected
+
+
+# =====================================================
+# PDF TEXT EXTRACTION
+# =====================================================
+@st.cache_data(show_spinner=False)
+def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+
+    for page_number, page in enumerate(document, start=1):
+        # Unsorted text often preserves report table reading order better.
+        raw_text = page.get_text("text", sort=False) or ""
+        sorted_text = page.get_text("text", sort=True) or ""
+        words = page.get_text("words", sort=True) or []
+
+        # Audit Trail pages contain a ruled six-column table. PyMuPDF table
+        # extraction preserves every row much more reliably than whole-page regex.
+        audit_rows = []
+        lower_text = raw_text.lower()
+        if (
+            "userid" in lower_text
+            and "description" in lower_text
+            and "category" in lower_text
+        ):
+            try:
+                table_finder = page.find_tables()
+                for table in table_finder.tables:
+                    extracted = table.extract() or []
+                    if not extracted:
+                        continue
+                    header = [normalize_space(cell) for cell in extracted[0]]
+                    if {"Timestamp", "State", "UserID", "Description", "Comment", "Category"}.issubset(set(header)):
+                        audit_rows.extend(extracted[1:])
+            except Exception:
+                audit_rows = []
+
+        pages.append(
+            {
+                "Page": page_number,
+                "Text": raw_text,
+                "Sorted Text": sorted_text,
+                "Words": words,
+                "Audit Rows": audit_rows,
+            }
+        )
+
+    document.close()
+    full_text = "\n".join(page["Text"] for page in pages)
+    sorted_full_text = "\n".join(page["Sorted Text"] for page in pages)
+    return full_text, sorted_full_text, pages
+
+
+# =====================================================
+# BATCH SUMMARY
+# =====================================================
+def extract_batch_summary(text):
+    summary = {
+        "Batch Number": find_first(
+            text,
+            [
+                r"Batch\s*No\.?\s*:\s*(.*?)\s*Batch\s*Start\s*Time",
+                r"Batch\s*Number\s*:\s*(.*?)\s*(?:\n|$)",
+            ],
+        ),
+        "Batch Start": find_first(
+            text,
+            [r"Batch\s*Start\s*Time\s*:\s*(.*?)\s*Batch\s*End\s*Time"],
+        ),
+        "Batch End": find_first(
+            text,
+            [r"Batch\s*End\s*Time\s*:\s*(.*?)\s*Batch\s*Running\s*Time"],
+        ),
+        "Runtime": find_first(
+            text,
+            [r"Batch\s*Running\s*Time(?:\s*\([^)]*\))?\s*:\s*(.*?)\s*Batch\s*Size"],
+        ),
+        "Batch Size": find_first(
+            text,
+            [r"Batch\s*Size\s*:\s*(.*?)\s*(?:Product\s*Name|Recipe|\n)"],
+        ),
+        "Product Name": find_first(
+            text,
+            [r"Product\s*Name\s*:\s*(.*?)\s*(?:Batch\s*No|Recipe|\n)"],
+        ),
+        "Recipe Name": find_first(
+            text,
+            [
+                r"Filling\s*Skid\s*Recipe\s*Name\s*:?\s*(.*?)\s*(?:\n|$)",
+                r"Recipe\s*Name\s*:\s*(.*?)\s*(?:\n|$)",
+            ],
+        ),
+    }
+    return pd.DataFrame([summary])
+
+
+# =====================================================
+# PRODUCTION COUNTERS
+# =====================================================
+def extract_production_counters(text, sorted_text=""):
+    columns = ["Counter Group", "Counter", "Value"]
+    combined = f"{text}\n{sorted_text}"
+    rows = []
+
+    # The report stores labels first and their values below them, for example:
+    # Infeed (pcs), Outfeed (pcs), Reject (pcs), followed by 1640, 1523, 117.
+    section_patterns = [
+        (
+            "Production Counters",
+            r"Production\s*Counters?\s*:\s*(.*?)\s*Check\s*Weigh\s*Reject\s*Counters?\s*:",
+            ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
+        ),
+        (
+            "Check Weigh Reject Counters",
+            r"Check\s*Weigh\s*Reject\s*Counters?\s*:\s*(.*?)\s*Air\s*Bubble\s*Reject\s*Counters?\s*:",
+            ["Weigh Cell 1", "Weigh Cell 2", "Weigh Cell 3", "Weigh Cell 4", "Total"],
+        ),
+        (
+            "Air Bubble Reject Counters",
+            r"Air\s*Bubble\s*Reject\s*Counters?\s*:\s*(.*?)\s*Needle\s*Bonding\s*Reject\s*Counters?\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+        (
+            "Needle Bonding Reject Counters",
+            r"Needle\s*Bonding\s*Reject\s*Counters?\s*:\s*(.*?)\s*Assembly\s*Reject\s*Counters?\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+        (
+            "Assembly Reject Counters",
+            r"Assembly\s*Reject\s*Counters?\s*:\s*(.*?)\s*Filling\s*speed\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+    ]
+
+    for group, pattern, expected_labels in section_patterns:
+        match = re.search(pattern, combined, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        section = match.group(1)
+        values = [int(x.replace(",", "")) for x in re.findall(r"(?m)^\s*(\d[\d,]*)\s*$", section)]
+        if len(values) >= len(expected_labels):
+            values = values[-len(expected_labels):]
+            for label, value in zip(expected_labels, values):
+                rows.append({"Counter Group": group, "Counter": label, "Value": value})
+
+    # Direct inline fallback for other report versions.
+    if not any(row["Counter Group"] == "Production Counters" for row in rows):
+        inline = re.search(
+            r"Infeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
+            r"Outfeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
+            r"Reject\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)",
+            combined,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if inline:
+            for label, value in zip(
+                ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
+                inline.groups(),
+            ):
+                rows.append(
+                    {
+                        "Counter Group": "Production Counters",
+                        "Counter": label,
+                        "Value": int(value),
+                    }
+                )
+
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame = frame.drop_duplicates(
+            subset=["Counter Group", "Counter"], keep="first"
+        ).reset_index(drop=True)
+    return frame
+
+
+def extract_filling_speed(text, sorted_text=""):
+    combined = f"{text}\n{sorted_text}"
+    match = re.search(
+        r"Filling\s*speed\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*([^\n]*)",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return pd.DataFrame(columns=["Parameter", "Value", "Unit"])
+
+    value = float(match.group(1).replace(",", "."))
+    unit = normalize_space(match.group(2)) or "syringes/min"
+    return pd.DataFrame(
+        [{"Parameter": "Filling Speed", "Value": value, "Unit": unit}]
+    )
+
+
+# =====================================================
+# FILL WEIGHT TABLE
+# =====================================================
+def _parse_fill_weight_stream(text):
+    rows = []
+    # Whitespace includes line breaks, so this handles horizontal and vertically split rows.
+    pattern = re.compile(
+        r"(\d{2}/\d{2}/\d{4})\s+"
+        r"(\d{2}:\d{2}:\d{2})\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
+        r"([01])\s+"
+        r"([01-])\s+"
+        r"([01-])\s+"
+        r"([01-])\s+"
+        r"([1-4])(?=\s|$)",
+        flags=re.MULTILINE,
+    )
+    for match in pattern.finditer(text):
+        values = [match.group(i).replace(",", ".") for i in (3, 4, 5)]
+        rows.append(
+            {
+                "Timestamp": f"{match.group(1)} {match.group(2)}",
+                "Nett Weight": float(values[0]),
+                "Gross Weight": float(values[1]),
+                "Tare Weight": float(values[2]),
+                "Weight Passed": int(match.group(6)),
+                "Air Bubble": match.group(7),
+                "Needle Bonding": match.group(8),
+                "Assembly": match.group(9),
+                "Position": int(match.group(10)),
+            }
+        )
+    return rows
+
+
+def _words_to_visual_lines(words, y_tolerance=2.5):
+    """Rebuild visual rows from PyMuPDF words using y coordinates."""
+    if not words:
+        return []
+    ordered = sorted(words, key=lambda w: (round(w[1] / y_tolerance), w[0]))
+    lines = []
+    current = []
+    current_y = None
+    for word in ordered:
+        y = float(word[1])
+        if current_y is None or abs(y - current_y) <= y_tolerance:
+            current.append(word)
+            current_y = y if current_y is None else (current_y + y) / 2
+        else:
+            lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
+            current = [word]
+            current_y = y
+    if current:
+        lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
+    return lines
+
+
+def extract_fill_weights(text, sorted_text="", pages=None):
+    columns = [
+        "Timestamp", "Nett Weight", "Gross Weight", "Tare Weight",
+        "Weight Passed", "Air Bubble", "Needle Bonding", "Assembly", "Position",
+    ]
+    rows = []
+
+    # Try both native PDF reading orders first.
+    rows.extend(_parse_fill_weight_stream(text))
+    rows.extend(_parse_fill_weight_stream(sorted_text))
+
+    # Reconstruct visual lines from word coordinates when plain text order is column-wise.
+    if pages:
+        for page in pages:
+            lower = f"{page.get('Text', '')} {page.get('Sorted Text', '')}".lower()
+            is_candidate = any(
+                key in lower
+                for key in ["nett weight", "net weight", "gross weight", "tare weight", "weight passed"]
+            )
+            if not is_candidate:
+                continue
+            visual_text = "\n".join(_words_to_visual_lines(page.get("Words", [])))
+            rows.extend(_parse_fill_weight_stream(visual_text))
+
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], dayfirst=True, errors="coerce")
+        frame = (
+            frame.dropna(subset=["Timestamp"])
+            .drop_duplicates()
+            .sort_values("Timestamp")
+            .reset_index(drop=True)
+        )
+    return frame
+
+
+# =====================================================
+# ALARM EXTRACTION
+# =====================================================
+def clean_alarm_chunk(text):
+    """Remove repeating column headers and page footers before parsing alarms."""
+    # The footer begins with Batch Number on every alarm page. Anything after that
+    # is report metadata and must never become part of an alarm message.
+    # Alarm data must end before the legend or Audit Trail, even when both
+    # sections occur on the same PDF page as the final alarm record.
+    text = re.split(
+        r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
+        text,
+        maxsplit=1,
+    )[0]
+    text = re.split(r"(?im)^\s*Batch\s+Number\s*:", text, maxsplit=1)[0]
+    text = re.sub(r"(?im)^\s*(Timestamp|State|MsgText|Code)\s*$", "", text)
+    text = re.sub(r"(?im)^\s*Page\s+\d+\s+of\s+\d+\s*$", "", text)
+    return text.strip()
+
+
+def parse_alarm_records(section_text, alarm_type):
+    columns = ["Timestamp", "State", "Message", "Code", "Alarm Type"]
+    rows = []
+    section_text = clean_alarm_chunk(section_text)
+    if not section_text:
+        return pd.DataFrame(columns=columns)
+
+    # A record is exactly: timestamp, state, message, integer code. The lookahead
+    # constrains the message to end before the next timestamp or end of clean chunk.
+    record_pattern = re.compile(
+        r"(\d{2}/\d{2}/\d{4})\s+"
+        r"(\d{2}:\d{2}:\d{2})\s+"
+        r"([+*\-])\s+"
+        r"(.+?)\s+"
+        r"(\d{1,5})\s*"
+        r"(?=(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+*\-])|$)",
+        flags=re.DOTALL,
+    )
+
+    for match in record_pattern.finditer(section_text):
+        message = normalize_space(match.group(4))
+        # Defensive removal of any metadata if a report variant puts footer text inline.
+        message = re.split(
+            r"\b(?:Batch Number|Product Name|Report Generated|Printed by|Page \d+ of \d+)\s*:",
+            message,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        message = normalize_space(message)
+        if not message:
+            continue
+        rows.append(
+            {
+                "Timestamp": f"{match.group(1)} {match.group(2)}",
+                "State": match.group(3),
+                "Message": message,
+                "Code": match.group(5),
+                "Alarm Type": alarm_type,
+            }
+        )
+
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame["Timestamp"] = pd.to_datetime(
+            frame["Timestamp"], dayfirst=True, errors="coerce"
+        )
+        frame = (
+            frame.dropna(subset=["Timestamp"])
+            .drop_duplicates()
+            .sort_values("Timestamp")
+            .reset_index(drop=True)
+        )
+    return frame
+
+
+def extract_alarm_tables(pages):
+    """Parse Safety, GMP and Equipment sections page-by-page with header state."""
+    category_aliases = [
+        ("Safety", re.compile(r"(?im)^\s*(?:Alarms?\s+Safety|Safety\s+Alarms?)\s*$")),
+        ("GMP", re.compile(r"(?im)^\s*(?:Alarms?\s+GMP|GMP\s+Alarms?)\s*$")),
+        ("Equipment", re.compile(r"(?im)^\s*(?:Equipment\s+Alarms?|Alarms?\s+Equipment)\s*$")),
+    ]
+    chunks = {"Safety": [], "GMP": [], "Equipment": []}
+    current_category = None
+
+    for page in pages:
+        page_text = page.get("Text", "") or ""
+        # Remove the footer separately on every page. This fixes the observed case
+        # where "Batch Number: ..." was appended to the final message on a page.
+        page_text = re.split(
+            r"(?im)^\s*Batch\s+Number\s*:", page_text, maxsplit=1
+        )[0]
+
+        # A page can contain the final alarm, the Alarm State Legend and the
+        # beginning of Audit Trail. Truncate before the legend/audit header so
+        # audit descriptions can never be appended to the final alarm message.
+        boundary = re.search(
+            r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
+            page_text,
+        )
+        reached_audit_boundary = boundary is not None
+        if boundary:
+            page_text = page_text[: boundary.start()]
+
+        # A page can contain the end of one category and the beginning of another.
+        header_hits = []
+        for category, header_pattern in category_aliases:
+            for hit in header_pattern.finditer(page_text):
+                header_hits.append((hit.start(), hit.end(), category))
+        header_hits.sort(key=lambda item: item[0])
+
+        cursor = 0
+        for hit_start, hit_end, new_category in header_hits:
+            if current_category and hit_start > cursor:
+                chunks[current_category].append(page_text[cursor:hit_start])
+            current_category = new_category
+            cursor = hit_end
+        if current_category and cursor < len(page_text):
+            chunks[current_category].append(page_text[cursor:])
+
+        # Stop carrying alarm state after the legend/audit boundary.
+        if reached_audit_boundary:
+            current_category = None
+
+    outputs = {}
+    for category in ["Safety", "GMP", "Equipment"]:
+        category_frames = []
+        for chunk in chunks[category]:
+            parsed = parse_alarm_records(chunk, category)
+            if not parsed.empty:
+                category_frames.append(parsed)
+        if category_frames:
+            outputs[category] = (
+                pd.concat(category_frames, ignore_index=True)
+                .drop_duplicates()
+                .sort_values("Timestamp")
+                .reset_index(drop=True)
+            )
+        else:
+            outputs[category] = empty_dataframe(
+                ["Timestamp", "State", "Message", "Code", "Alarm Type"]
+            )
+    return outputs["Safety"], outputs["GMP"], outputs["Equipment"]
+
+
+def extract_safety_alarms(pages):
+    return extract_alarm_tables(pages)[0]
+
+
+def extract_gmp_alarms(pages):
+    return extract_alarm_tables(pages)[1]
+
+
+def extract_equipment_alarms(pages):
+    return extract_alarm_tables(pages)[2]
+
+
+# =====================================================
+# AUDIT TRAIL EXTRACTION
+# =====================================================
+def extract_audit_trail(pages):
+    columns = [
+        "Page",
+        "Timestamp",
+        "State",
+        "User",
+        "Description",
+        "Comment",
+        "Category",
+        "Action",
+        "Audit Record",
+    ]
+    rows = []
+
+    def clean_cell(value):
+        value = str(value or "").replace("\n", " ")
+        value = normalize_space(value)
+        # Remove isolated layout underscores introduced by PDF cell extraction.
+        value = re.sub(r"(?<!\w)_+(?!\w)", " ", value)
+        return normalize_space(value)
+
+    def refine_audit_text(value):
+        """Repair words split by narrow PDF table cells without changing meaning."""
+        value = clean_cell(value)
+        if not value:
+            return ""
+
+        # Exact fragment repairs observed in this report and common HMI audit text.
+        replacements = {
+            r"\bN\s+ot\b": "Not",
+            r"\bH\s+MI\b": "HMI",
+            r"\bP\s+LC\b": "PLC",
+            r"\bCon\s+nection\b": "Connection",
+            r"\bConn\s+ection\b": "Connection",
+            r"\bPowere\s+d\b": "Powered",
+            r"\blogg\s+ed\b": "logged",
+            r"\bM\s+anager\b": "Manager",
+            r"\bv\s+alue\b": "value",
+            r"\bBat\s+ch\b": "Batch",
+            r"\bR\s+obot\b": "Robot",
+            r"\bG\s+eneral\b": "General",
+            r"\bU\s+nit\b": "Unit",
+            r"\bG\s+uarding\b": "Guarding",
+            r"\bD\s+oors\b": "Doors",
+            r"\badministr\s+ation\b": "administration",
+            r"\bAcknowledge\s+ment\b": "Acknowledgment",
+            r"\bdescrip\s+tion\b": "description",
+            r"\bproduc\s+tion\b": "production",
+            r"\binter\s+face\b": "interface",
+            r"\bInterface\s+PMQ\b": "Interface PMQ",
+        }
+        for pattern, replacement in replacements.items():
+            value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+
+        # Repair known technical identifiers split by the narrow UserID column.
+        value = re.sub(r"\bINF11DP\s+R-E(\d+)\b", r"INF11DPR-E\1", value)
+        value = re.sub(r"/P\s+(\d{5,})\b", r"/P\1", value)
+        value = re.sub(r"\bHMI[_ ]?Con\s*nection[_ ]?(\d+)\b", r"HMI_Connection_\1", value, flags=re.IGNORECASE)
+        value = re.sub(r"\bHMI\s+Connection\s+(\d+)\b", r"HMI Connection \1", value, flags=re.IGNORECASE)
+
+        # Repair a single trailing letter split from a sufficiently long word,
+        # but only for endings commonly produced by column wrapping.
+        value = re.sub(
+            r"\b([A-Za-z]{4,})([ ]+)([dgry])\b",
+            lambda m: m.group(1) + m.group(3)
+            if (m.group(1) + m.group(3)).lower() in {
+                "powered", "logged", "manager", "empty", "running",
+                "stopped", "started", "changed", "closed", "opened",
+            }
+            else m.group(0),
+            value,
+            flags=re.IGNORECASE,
+        )
+        return normalize_space(value)
+
+    def normalize_audit_timestamp(value):
+        value = clean_cell(value)
+        # The narrow timestamp column wraps the hour, e.g.
+        # "02/08/2026 2\n2:32:01". After newline removal this becomes
+        # "02/08/2026 2 2:32:01" and must be rejoined to 22:32:01.
+        value = re.sub(
+            r"(\d{2}/\d{2}/\d{4})\s+(\d)\s+(\d:\d{2}:\d{2})",
+            r"\1 \2\3",
+            value,
+        )
+        value = re.sub(
+            r"(\d{2}/\d{2}/\d{4})\s+(\d{2})\s+(\d:\d{2}:\d{2})",
+            r"\1 \2\3",
+            value,
+        )
+        match = re.search(
+            r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}",
+            value,
+        )
+        return match.group(0) if match else ""
+
+    for page in pages:
+        page_number = page.get("Page", "")
+        for raw_row in page.get("Audit Rows", []) or []:
+            if not raw_row or len(raw_row) < 6:
+                continue
+            timestamp_text = normalize_audit_timestamp(raw_row[0])
+            if not timestamp_text:
+                continue
+
+            state = clean_cell(raw_row[1])
+            user = refine_audit_text(raw_row[2])
+            description = refine_audit_text(raw_row[3])
+            comment = refine_audit_text(raw_row[4])
+            category = refine_audit_text(raw_row[5])
+
+            # Category sometimes contains an alarm number such as "Alarm: 525".
+            # Preserve it exactly rather than discarding the field.
+            action = description
+            audit_record = " | ".join(
+                part
+                for part in [state, user, description, comment, category]
+                if part
+            )
+            rows.append(
+                {
+                    "Page": page_number,
+                    "Timestamp": timestamp_text,
+                    "State": state,
+                    "User": user,
+                    "Description": description,
+                    "Comment": comment,
+                    "Category": category,
+                    "Action": action,
+                    "Audit Record": audit_record,
+                }
+            )
+
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame["Timestamp"] = pd.to_datetime(
+            frame["Timestamp"], dayfirst=True, errors="coerce"
+        )
+        frame = frame.dropna(subset=["Timestamp"]).reset_index(drop=True)
+        # Do not drop duplicates. Some audit events genuinely repeat at the same
+        # second and every printed table row must be retained.
+    return frame
+
+
+# =====================================================
+# FINAL ALARM MESSAGE SANITIZATION
+# =====================================================
+def sanitize_alarm_messages(alarm_df):
+    """Final guard against legend, audit-trail, and footer text entering alarms."""
+    if alarm_df is None or alarm_df.empty:
+        return alarm_df
+
+    cleaned = alarm_df.copy()
+    stop_pattern = re.compile(
+        r"\s*(?:"
+        r"Alarm\s+State\s+Legend|"
+        r"Audit\s+Trail|"
+        r"UserID\s+Description\s+Comment\s+Category|"
+        r"Timestamp\s+State\s+UserID|"
+        r"\+\s+Incoming\s+Alarm|"
+        r"-\s+Outgoing\s+Alarm|"
+        r"\*\s+Acknowledge\s+Alarm|"
+        r"Batch\s+Number\s*:|"
+        r"Product\s+Name\s*:|"
+        r"Report\s+Generated\s*:|"
+        r"Printed\s+by\s*:|"
+        r"Page\s+\d+\s+of\s+\d+"
+        r")",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def clean_message(value):
+        message = normalize_space(value)
+        return normalize_space(stop_pattern.split(message, maxsplit=1)[0])
+
+    cleaned["Message"] = cleaned["Message"].map(clean_message)
+    cleaned = cleaned[cleaned["Message"].str.len().gt(0)].copy()
+    return cleaned.drop_duplicates().reset_index(drop=True)
+
+
+# =====================================================
+# SUMMARIES
+# =====================================================
+def create_alarm_summary(alarm_df):
+    columns = ["Code", "Message", "Occurrences"]
+    if alarm_df.empty:
+        return empty_dataframe(columns)
+
+    summary = (
+        alarm_df.groupby(["Code", "Message"], dropna=False)
+        .size()
+        .reset_index(name="Occurrences")
+        .sort_values(["Occurrences", "Message"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return summary
+
+
+def create_audit_action_summary(audit_df):
+    columns = ["Action", "Occurrences"]
+    if audit_df.empty:
+        return empty_dataframe(columns)
+
+    summary = (
+        audit_df.assign(Action=audit_df["Action"].fillna("").map(normalize_space))
+        .query("Action != ''")
+        .groupby("Action", dropna=False)
+        .size()
+        .reset_index(name="Occurrences")
+        .sort_values(["Occurrences", "Action"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return summary
+
+
+def create_audit_user_summary(audit_df):
+    columns = ["User", "Occurrences"]
+    if audit_df.empty or "User" not in audit_df.columns:
+        return empty_dataframe(columns)
+
+    user_data = audit_df[audit_df["User"].fillna("").str.strip().ne("")]
+    if user_data.empty:
+        return empty_dataframe(columns)
+
+    return (
+        user_data.groupby("User")
+        .size()
+        .reset_index(name="Occurrences")
+        .sort_values("Occurrences", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# =====================================================
+# PLOTLY FIGURES
+# =====================================================
+def apply_graph_style(fig, title, x_title, y_title):
+    fig.update_layout(
+        title={"text": title, "x": 0.5, "xanchor": "center"},
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        template="plotly_white",
+        font=dict(family="Times New Roman", size=12),
+        title_font=dict(family="Times New Roman", size=24),
+        legend_title_text="",
+        hovermode="closest",
+        margin=dict(l=60, r=30, t=80, b=60),
+    )
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="#b8b8b8",
+        gridwidth=1,
+        title_font=dict(family="Times New Roman", size=12),
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor="#b8b8b8",
+        gridwidth=1,
+        title_font=dict(family="Times New Roman", size=12),
+    )
+    return fig
+
+
+def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit):
+    fig = px.scatter(
+        fill_pass_df,
+        x="Sample No",
+        y="Nett Weight",
+        color="Position",
+        color_discrete_sequence=px.colors.qualitative.Safe,
+        hover_data=[
+            "Timestamp",
+            "Gross Weight",
+            "Tare Weight",
+            "Position",
+        ],
+    )
+    fig.update_traces(marker=dict(size=7, opacity=0.82))
+    fig.add_hline(
+        y=upper_limit,
+        line_width=4,
+        line_color="#9e9e9e",
+        annotation_text=f"Upper limit: {upper_limit:g}",
+        annotation_position="top left",
+    )
+    fig.add_hline(
+        y=lower_limit,
+        line_width=4,
+        line_color="#f28e2b",
+        annotation_text=f"Lower limit: {lower_limit:g}",
+        annotation_position="bottom left",
+    )
+    return apply_graph_style(
+        fig,
+        f"{batch_label} - Fill weight data",
+        "Sample Number",
+        "Nett Weight",
+    )
+
+
+def make_fill_histogram(fill_pass_df, batch_label, bins):
+    fig = px.histogram(
+        fill_pass_df,
+        x="Nett Weight",
+        nbins=bins,
+        color_discrete_sequence=["#5b9bd5"],
+    )
+    fig.update_traces(marker_line_color="white", marker_line_width=0.6)
+    return apply_graph_style(
+        fig,
+        f"{batch_label} - Fill weight data",
+        "Nett Weight",
+        "Frequency",
+    )
+
+
+# =====================================================
+# EXCEL EXPORT
+# =====================================================
+def build_excel(dataframes):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sheets_written = 0
+        for sheet_name, dataframe in dataframes.items():
+            if dataframe is None or dataframe.empty:
+                continue
+            export_df = dataframe.copy()
+            for column in export_df.select_dtypes(include=["datetimetz"]).columns:
+                export_df[column] = export_df[column].dt.tz_localize(None)
+            export_df.to_excel(
+                writer,
+                sheet_name=sheet_name[:31],
+                index=False,
+            )
+            sheets_written += 1
+
+        if sheets_written == 0:
+            pd.DataFrame({"Information": ["No data was extracted."]}).to_excel(
+                writer,
+                sheet_name="Information",
+                index=False,
+            )
+
+    output.seek(0)
+    return output
+
+
+# =====================================================
+# INTERACTIVE PLOT CONFIGURATION
+# =====================================================
+PLOTLY_CONFIG = {
+    "displaylogo": False,
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "editable": True,
+    "edits": {
+        "axisTitleText": True,
+        "legendText": True,
+        "annotationText": True,
+        "titleText": True,
+    },
+    "toImageButtonOptions": {
+        "format": "png",
+        "filename": "interactive_graph",
+        "height": 700,
+        "width": 1400,
+        "scale": 2,
+    },
+}
+
+
+def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=False):
+    # Keep only layout properties supported across older and newer Plotly versions.
+    # Graph editing is enabled through the Plotly config passed to st.plotly_chart.
+    fig.update_layout(
+        dragmode="zoom",
+        hovermode="closest",
+        clickmode="event+select",
+        selectdirection="any",
+        uirevision="keep-user-zoom",
+    )
+    fig.update_xaxes(
+        showgrid=show_x_grid,
+        rangeslider_visible=show_range_slider,
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikedash="dot",
+    )
+    fig.update_yaxes(
+        showgrid=show_y_grid,
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikedash="dot",
+    )
+    return fig
+
+
+def figure_to_html_bytes(fig):
+    return fig.to_html(
+        full_html=True,
+        include_plotlyjs=True,
+        config=PLOTLY_CONFIG,
+    ).encode("utf-8")
+
+
+# =====================================================
+# STREAMLIT UI
+# =====================================================
+# =====================================================
+# MULTI-BATCH ANALYSIS
+# =====================================================
+def safe_file_stem(name):
+    stem = str(name).rsplit(".", 1)[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
+    return stem or "batch_report"
+
+
+def analyze_batch_report(pdf_bytes, source_name):
+    full_text, sorted_full_text, pages = extract_pdf_pages(pdf_bytes)
+    summary_df = extract_batch_summary(full_text)
+    production_df = extract_production_counters(full_text, sorted_full_text)
+    fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
+    safety_df, gmp_df, equipment_df = extract_alarm_tables(pages)
+    safety_df = sanitize_alarm_messages(safety_df)
+    gmp_df = sanitize_alarm_messages(gmp_df)
+    equipment_df = sanitize_alarm_messages(equipment_df)
+    audit_df = extract_audit_trail(pages)
+
+    fill_pass_df = fill_df[fill_df["Weight Passed"].eq(1)].copy()
+    if not fill_pass_df.empty:
+        fill_pass_df = fill_pass_df.sort_values("Timestamp").reset_index(drop=True)
+        fill_pass_df["Sample No"] = range(1, len(fill_pass_df) + 1)
+
+    alarm_frames = [df for df in [safety_df, gmp_df, equipment_df] if not df.empty]
+    all_alarms_df = (
+        pd.concat(alarm_frames, ignore_index=True)
+        if alarm_frames
+        else empty_dataframe(["Timestamp", "State", "Message", "Code", "Alarm Type"])
+    )
+    if not all_alarms_df.empty:
+        all_alarms_df = all_alarms_df.sort_values("Timestamp").reset_index(drop=True)
+
+    batch_number = ""
+    if not summary_df.empty:
+        batch_number = normalize_space(summary_df.iloc[0].get("Batch Number", ""))
+    batch_label = batch_number or safe_file_stem(source_name)
+
+    return {
+        "source_name": source_name,
+        "batch_label": batch_label,
+        "pages": pages,
+        "summary": summary_df,
+        "production": production_df,
+        "fill": fill_df,
+        "fill_pass": fill_pass_df,
+        "safety": safety_df,
+        "gmp": gmp_df,
+        "equipment": equipment_df,
+        "alarms": all_alarms_df,
+        "alarm_summary": create_alarm_summary(all_alarms_df),
+        "audit": audit_df,
+        "audit_action_summary": create_audit_action_summary(audit_df),
+        "audit_user_summary": create_audit_user_summary(audit_df),
+    }
+
+
+def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
+                          show_x_grid, show_y_grid, show_range_slider,
+                          marker_size, marker_opacity):
+    batch_label = result["batch_label"]
+    summary_df = result["summary"]
+    production_df = result["production"]
+    fill_df = result["fill"]
+    fill_pass_df = result["fill_pass"]
+    all_alarms_df = result["alarms"]
+    alarm_summary_df = result["alarm_summary"]
+    audit_df = result["audit"]
+    audit_action_summary_df = result["audit_action_summary"]
+    audit_user_summary_df = result["audit_user_summary"]
+
+    st.subheader(batch_label)
+    st.caption(f"Source file: {result['source_name']}")
+
+    summary_tab, production_tab, fill_tab, alarms_tab, audit_tab = st.tabs(
+        ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail"]
+    )
+
+    with summary_tab:
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        total = len(fill_df)
+        passed = len(fill_pass_df)
+        failed = total - passed
+        pass_rate = passed / total * 100 if total else 0.0
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Fill Records", f"{total:,}")
+        c2.metric("Fill Weight Passed", f"{passed:,}")
+        c3.metric("Fill Weight Not Passed", f"{failed:,}")
+        c4.metric("Pass Rate", f"{pass_rate:.2f}%")
+        a1, a2, a3 = st.columns(3)
+        a1.metric("All Alarm Events", f"{len(all_alarms_df):,}")
+        a2.metric("Audit Records", f"{len(audit_df):,}")
+        a3.metric("PDF Pages", f"{len(result['pages']):,}")
+
+    with production_tab:
+        if production_df.empty:
+            st.warning("No structured production counters were detected for this batch.")
+        else:
+            st.dataframe(production_df, use_container_width=True, hide_index=True)
+            groups = production_df["Counter Group"].drop_duplicates().tolist()
+            selected_group = st.selectbox(
+                "Counter group to plot", groups, key=f"production_group_{batch_key}"
+            )
+            plot_df = production_df[production_df["Counter Group"].eq(selected_group)]
+            fig = px.bar(plot_df, x="Counter", y="Value", color="Counter", text="Value")
+            fig.update_traces(textposition="outside")
+            fig = apply_graph_style(fig, selected_group, "Counter", "Value")
+            fig = make_interactive(fig, show_x_grid, show_y_grid, False)
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
+                            key=f"production_plot_{batch_key}")
+            st.download_button(
+                "Download Interactive Production Chart",
+                figure_to_html_bytes(fig),
+                file_name=f"{safe_file_stem(batch_label)}_production.html",
+                mime="text/html",
+                key=f"production_html_{batch_key}",
+                use_container_width=True,
+            )
+
+    with fill_tab:
+        if fill_df.empty:
+            st.warning("No fill-weight records were detected for this batch.")
+        else:
+            f1, f2, f3, f4 = st.columns(4)
+            f1.metric("Passed Records", f"{len(fill_pass_df):,}")
+            f2.metric("Mean Nett Weight", f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A")
+            f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
+            f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
+
+            choice = st.radio(
+                "Fill-weight table", ["Passed only", "All records"], horizontal=True,
+                key=f"fill_table_{batch_key}"
+            )
+            st.dataframe(fill_pass_df if choice == "Passed only" else fill_df,
+                         use_container_width=True, hide_index=True)
+
+            if not fill_pass_df.empty and lower_limit < upper_limit:
+                positions = sorted(fill_pass_df["Position"].dropna().unique().tolist())
+                selected_positions = st.multiselect(
+                    "Positions to display", positions, default=positions,
+                    key=f"positions_{batch_key}"
+                )
+                graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
+                if not graph_df.empty:
+                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit)
+                    scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
+                    scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
+                    st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
+                                    key=f"fill_scatter_{batch_key}")
+                    st.download_button(
+                        "Download Interactive Fill-Weight Graph",
+                        figure_to_html_bytes(scatter),
+                        file_name=f"{safe_file_stem(batch_label)}_fill_weight.html",
+                        mime="text/html", key=f"fill_html_{batch_key}",
+                        use_container_width=True,
+                    )
+
+                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins)
+                    histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
+                    st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
+                                    key=f"histogram_{batch_key}")
+                    st.download_button(
+                        "Download Interactive Histogram",
+                        figure_to_html_bytes(histogram),
+                        file_name=f"{safe_file_stem(batch_label)}_histogram.html",
+                        mime="text/html", key=f"hist_html_{batch_key}",
+                        use_container_width=True,
+                    )
+
+    with alarms_tab:
+        if all_alarms_df.empty:
+            st.warning("No structured alarm records were detected for this batch.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Alarm Events", f"{len(all_alarms_df):,}")
+            c2.metric("Unique Alarm Types", f"{len(alarm_summary_df):,}")
+            c3.metric("Repeated Alarm Types", f"{int((alarm_summary_df['Occurrences'] > 1).sum()):,}")
+            c4.metric("Alarm Categories", f"{all_alarms_df['Alarm Type'].nunique():,}")
+
+            categories = sorted(all_alarms_df["Alarm Type"].dropna().unique().tolist())
+            chosen = st.multiselect("Alarm categories", categories, default=categories,
+                                    key=f"alarm_categories_{batch_key}")
+            filtered = all_alarms_df[all_alarms_df["Alarm Type"].isin(chosen)]
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+            filtered_summary = create_alarm_summary(filtered)
+            st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
+
+            top = filtered_summary.head(20).sort_values("Occurrences")
+            if not top.empty:
+                pareto = px.bar(top, x="Occurrences", y="Message", orientation="h",
+                                hover_data=["Code"], color_discrete_sequence=["#d9534f"])
+                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message")
+                pareto = make_interactive(pareto, show_x_grid, show_y_grid, False)
+                st.plotly_chart(pareto, use_container_width=True, config=PLOTLY_CONFIG,
+                                key=f"alarm_pareto_{batch_key}")
+
+            timeline_df = filtered.dropna(subset=["Timestamp"]).copy()
+            if not timeline_df.empty:
+                timeline_df["Hour"] = timeline_df["Timestamp"].dt.floor("h")
+                counts = timeline_df.groupby(["Hour", "Alarm Type"]).size().reset_index(name="Occurrences")
+                timeline = px.line(counts, x="Hour", y="Occurrences", color="Alarm Type", markers=True)
+                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences")
+                timeline = make_interactive(timeline, show_x_grid, show_y_grid, show_range_slider)
+                st.plotly_chart(timeline, use_container_width=True, config=PLOTLY_CONFIG,
+                                key=f"alarm_timeline_{batch_key}")
+
+    with audit_tab:
+        if audit_df.empty:
+            st.warning("No structured audit-trail records were detected for this batch.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Audit Records", f"{len(audit_df):,}")
+            c2.metric("Unique Actions", f"{len(audit_action_summary_df):,}")
+            c3.metric("Repeated Actions", f"{int((audit_action_summary_df['Occurrences'] > 1).sum()):,}")
+            st.dataframe(audit_df, use_container_width=True, hide_index=True)
+            st.subheader("Audit Action Frequency Summary")
+            st.dataframe(audit_action_summary_df, use_container_width=True, hide_index=True)
+
+            top_actions = audit_action_summary_df.head(20).sort_values("Occurrences")
+            if not top_actions.empty:
+                action_fig = px.bar(top_actions, x="Occurrences", y="Action", orientation="h",
+                                    color_discrete_sequence=["#5b9bd5"])
+                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action")
+                action_fig = make_interactive(action_fig, show_x_grid, show_y_grid, False)
+                st.plotly_chart(action_fig, use_container_width=True, config=PLOTLY_CONFIG,
+                                key=f"audit_actions_{batch_key}")
+
+            if not audit_user_summary_df.empty:
+                user_fig = px.bar(audit_user_summary_df.head(20), x="User", y="Occurrences",
+                                  color="User", text="Occurrences")
+                user_fig.update_traces(textposition="outside")
+                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences")
+                user_fig = make_interactive(user_fig, show_x_grid, show_y_grid, False)
+                st.plotly_chart(user_fig, use_container_width=True, config=PLOTLY_CONFIG,
+                                key=f"audit_users_{batch_key}")
+
+    excel_file = build_excel({
+        "Batch Summary": summary_df,
+        "Production Counters": production_df,
+        "Fill Weight All": fill_df,
+        "Fill Weight Passed": fill_pass_df,
+        "All Alarms": all_alarms_df,
+        "All Alarm Summary": alarm_summary_df,
+        "Audit Trail": audit_df,
+        "Audit Action Summary": audit_action_summary_df,
+        "Audit User Summary": audit_user_summary_df,
+    })
+    excel_name = f"{safe_file_stem(batch_label)}_Batch_Report_Analysis.xlsx"
+    st.download_button(
+        "Download This Batch Excel Report", excel_file, file_name=excel_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"excel_{batch_key}", use_container_width=True,
+    )
+    return excel_name, excel_file.getvalue()
+
+
+# =====================================================
+# STREAMLIT UI
+# =====================================================
+st.title("Multi-Batch Report Analyzer")
+st.caption("Upload multiple batch-report PDFs. Each batch is extracted and analyzed separately.")
+
+uploaded_files = st.file_uploader(
+    "Upload one or more batch report PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+if not uploaded_files:
+    st.info("Upload one or more PDF reports to begin.")
+    st.stop()
+
+st.sidebar.header("Graph Settings")
+lower_limit = st.sidebar.number_input("Lower fill-weight limit", value=526.0)
+upper_limit = st.sidebar.number_input("Upper fill-weight limit", value=540.0)
+histogram_bins = st.sidebar.slider("Histogram bins", 5, 60, 20)
+show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
+show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
+show_range_slider = st.sidebar.checkbox("Show X-axis range slider", value=True)
+marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
+marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
+
+if lower_limit >= upper_limit:
+    st.error("Lower fill-weight limit must be less than the upper limit.")
+    st.stop()
+
+results = []
+progress = st.progress(0, text="Preparing batch analyses...")
+for index, uploaded in enumerate(uploaded_files):
+    try:
+        result = analyze_batch_report(uploaded.getvalue(), uploaded.name)
+        results.append(result)
+    except Exception as exc:
+        st.error(f"Could not process {uploaded.name}: {exc}")
+    progress.progress((index + 1) / len(uploaded_files), text=f"Processed {index + 1} of {len(uploaded_files)} reports")
+progress.empty()
+
+if not results:
+    st.error("None of the uploaded reports could be processed.")
+    st.stop()
+
+st.success(f"Completed separate analysis for {len(results)} batch report(s).")
+
+# A separate top-level tab is created for every uploaded batch.
+batch_tabs = st.tabs([result["batch_label"][:40] for result in results])
+zip_buffer = BytesIO()
+with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for index, (tab, result) in enumerate(zip(batch_tabs, results), start=1):
+        batch_key = f"batch_{index}_{safe_file_stem(result['source_name'])}"
+        with tab:
+            excel_name, excel_bytes = render_batch_analysis(
+                result, batch_key, lower_limit, upper_limit, histogram_bins,
+                show_x_grid, show_y_grid, show_range_slider,
+                marker_size, marker_opacity,
+            )
+        archive.writestr(excel_name, excel_bytes)
+zip_buffer.seek(0)
+
+st.divider()
+st.download_button(
+    "Download All Batch Excel Reports as ZIP",
+    data=zip_buffer.getvalue(),
+    file_name="All_Batch_Report_Analyses.zip",
+    mime="application/zip",
+    use_container_width=True,
+)
+
+with st.expander("Multi-batch extraction summary"):
+    summary_rows = []
+    for result in results:
+        summary_rows.append({
+            "Source File": result["source_name"],
+            "Batch": result["batch_label"],
+            "Fill Records": len(result["fill"]),
+            "Passed Fill Records": len(result["fill_pass"]),
+            "Alarm Events": len(result["alarms"]),
+            "Audit Records": len(result["audit"]),
+            "PDF Pages": len(result["pages"]),
+        })
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    st.caption("Parser version: 2026-10-13-v7-multibatch")
