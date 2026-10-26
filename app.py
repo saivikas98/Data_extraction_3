@@ -1387,31 +1387,59 @@ if lower_limit >= upper_limit:
     st.error("Lower fill-weight limit must be less than the upper limit.")
     st.stop()
 
-results = []
-progress = st.progress(0, text="Preparing batch analyses...")
-for index, uploaded in enumerate(uploaded_files):
-    try:
-        pdf_bytes = uploaded.getvalue()
-        result = analyze_batch_report(pdf_bytes, uploaded.name)
-        results.append(result)
-        del pdf_bytes
-        gc.collect()
-    except Exception as exc:
-        st.error(f"Could not process {uploaded.name}: {exc}")
-    progress.progress((index + 1) / len(uploaded_files), text=f"Processed {index + 1} of {len(uploaded_files)} reports")
-progress.empty()
+analyze_clicked = st.button(
+    "Analyze Uploaded Reports",
+    type="primary",
+    use_container_width=True,
+)
+
+if analyze_clicked:
+    # Remove any previous structured results before a new extraction run.
+    st.session_state.pop("analysis_results", None)
+    results = []
+    progress = st.progress(0, text="Preparing batch analyses...")
+    for index, uploaded in enumerate(uploaded_files):
+        try:
+            pdf_bytes = uploaded.getvalue()
+            result = analyze_batch_report(pdf_bytes, uploaded.name)
+            results.append(result)
+            del pdf_bytes
+            gc.collect()
+        except Exception as exc:
+            st.error(f"Could not process {uploaded.name}: {exc}")
+        progress.progress(
+            (index + 1) / len(uploaded_files),
+            text=f"Processed {index + 1} of {len(uploaded_files)} reports",
+        )
+    progress.empty()
+
+    if results:
+        uploaded_report_count = len(results)
+        results = combine_same_batch_reports(results)
+        st.session_state["analysis_results"] = results
+        st.session_state["uploaded_report_count"] = uploaded_report_count
+    else:
+        st.error("None of the uploaded reports could be processed.")
+
+results = st.session_state.get("analysis_results", [])
 
 if not results:
-    st.error("None of the uploaded reports could be processed.")
+    st.info(
+        "Files are selected but have not been processed. Click "
+        "**Analyze Uploaded Reports** to start. The app will not automatically "
+        "reprocess retained uploads when it starts or reruns."
+    )
     st.stop()
 
-uploaded_report_count = len(results)
-results = combine_same_batch_reports(results)
+uploaded_report_count = st.session_state.get("uploaded_report_count", len(results))
 combined_batch_count = len(results)
-merged_group_count = sum(1 for result in results if result.get("report_count", 1) > 1)
+merged_group_count = sum(
+    1 for result in results if result.get("report_count", 1) > 1
+)
 
 st.success(
-    f"Processed {uploaded_report_count} report(s) into {combined_batch_count} batch analysis group(s). "
+    f"Processed {uploaded_report_count} report(s) into "
+    f"{combined_batch_count} batch analysis group(s). "
     f"Merged batch groups: {merged_group_count}."
 )
 
@@ -1452,4 +1480,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v13-memory-safe")
+    st.caption("Parser version: 2026-10-26-v14-manual-analysis-start")
