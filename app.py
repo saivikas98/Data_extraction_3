@@ -81,6 +81,9 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
+    # Must be initialized before the first page. Some reports do not contain
+    # an Audit Trail header until hundreds of pages later.
+    audit_section_active = False
 
     for page_number, page in enumerate(document, start=1):
         # Unsorted text often preserves report table reading order better.
@@ -1374,4 +1377,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": len(result["pages"]),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v9-privacy-audit-pump-colors")
+    st.caption("Parser version: 2026-10-26-v10-audit-state-fix")
