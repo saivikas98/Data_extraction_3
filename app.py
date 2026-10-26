@@ -1056,6 +1056,74 @@ def figure_to_html_bytes(fig):
     ).encode("utf-8")
 
 
+def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, font_size, x_min=None, x_max=None, y_min=None, y_max=None):
+    """Create standalone HTML with editable lower and upper limit inputs."""
+    div_id = "fill_weight_scatter"
+    chart_html = fig.to_html(
+        full_html=False, include_plotlyjs=True, config=PLOTLY_CONFIG, div_id=div_id
+    )
+    safe_font = str(font_family).replace("\'", "")
+    size = str(int(font_size))
+    lower = repr(float(lower_limit))
+    upper = repr(float(upper_limit))
+    initial_x_min = "" if x_min is None else repr(float(x_min))
+    initial_x_max = "" if x_max is None else repr(float(x_max))
+    initial_y_min = "" if y_min is None else repr(float(y_min))
+    initial_y_max = "" if y_max is None else repr(float(y_max))
+    controls = (
+        "<div style=\"font-family:" + safe_font + ";font-size:" + size + "px;padding:12px 16px;"
+        "border:1px solid #d9d9d9;border-radius:8px;margin:10px 0;display:flex;gap:14px;"
+        "align-items:end;flex-wrap:wrap;background:#fafafa;\">"
+        "<label>Lower fill-weight limit<br><input id=\"lowerLimitInput\" type=\"number\" step=\"0.1\" value=\"" + lower + "\"></label>"
+        "<label>Upper fill-weight limit<br><input id=\"upperLimitInput\" type=\"number\" step=\"0.1\" value=\"" + upper + "\"></label>"
+        "<label>X-axis minimum<br><input id=\"xMinInput\" type=\"number\" step=\"1\" value=\"" + initial_x_min + "\"></label>"
+        "<label>X-axis maximum<br><input id=\"xMaxInput\" type=\"number\" step=\"1\" value=\"" + initial_x_max + "\"></label>"
+        "<label>Y-axis minimum<br><input id=\"yMinInput\" type=\"number\" step=\"0.1\" value=\"" + initial_y_min + "\"></label>"
+        "<label>Y-axis maximum<br><input id=\"yMaxInput\" type=\"number\" step=\"0.1\" value=\"" + initial_y_max + "\"></label>"
+        "<button id=\"applyLimitsButton\">Apply Limits</button>"
+        "<button id=\"applyAxesButton\">Apply Axis Range</button>"
+        "<button id=\"autoAxesButton\">Auto Axis Range</button>"
+        "<button id=\"hideLimitsButton\">Hide Limits</button>"
+        "<button id=\"resetLimitsButton\">Reset Original Limits</button>"
+        "<span id=\"limitMessage\" style=\"color:#b00020;\"></span></div>"
+    )
+    script = "".join([
+        "<script>(function(){",
+        "const plot=document.getElementById(\"" + div_id + "\");",
+        "const lo=document.getElementById(\"lowerLimitInput\");",
+        "const hi=document.getElementById(\"upperLimitInput\");",
+        "const msg=document.getElementById(\"limitMessage\");",
+        "const xMin=document.getElementById(\"xMinInput\");const xMax=document.getElementById(\"xMaxInput\");",
+        "const yMin=document.getElementById(\"yMinInput\");const yMax=document.getElementById(\"yMaxInput\");",
+        "const originalLower=" + lower + ";const originalUpper=" + upper + ";",
+        "function layout(l,u){return {shapes:[",
+        "{type:\"line\",xref:\"paper\",x0:0,x1:1,yref:\"y\",y0:u,y1:u,line:{color:\"#9e9e9e\",width:4}},",
+        "{type:\"line\",xref:\"paper\",x0:0,x1:1,yref:\"y\",y0:l,y1:l,line:{color:\"#f28e2b\",width:4}}],",
+        "annotations:[{x:0.01,xref:\"paper\",y:u,yref:\"y\",text:\"Upper limit: \"+u,showarrow:false},",
+        "{x:0.01,xref:\"paper\",y:l,yref:\"y\",text:\"Lower limit: \"+l,showarrow:false}]};}",
+        "function apply(){const l=Number(lo.value),u=Number(hi.value);",
+        "if(!Number.isFinite(l)||!Number.isFinite(u)||l>=u){msg.textContent=\"Lower limit must be less than upper limit.\";return;}",
+        "msg.textContent=\"\";Plotly.relayout(plot,layout(l,u));}",
+        "function axisValue(el){return el.value.trim()===\"\"?null:Number(el.value);}",
+        "function applyAxes(){const xmin=axisValue(xMin),xmax=axisValue(xMax),ymin=axisValue(yMin),ymax=axisValue(yMax);",
+        "if((xmin!==null&&!Number.isFinite(xmin))||(xmax!==null&&!Number.isFinite(xmax))||(ymin!==null&&!Number.isFinite(ymin))||(ymax!==null&&!Number.isFinite(ymax))){msg.textContent=\"Axis limits must be valid numbers.\";return;}",
+        "if(xmin!==null&&xmax!==null&&xmin>=xmax){msg.textContent=\"X-axis minimum must be less than maximum.\";return;}",
+        "if(ymin!==null&&ymax!==null&&ymin>=ymax){msg.textContent=\"Y-axis minimum must be less than maximum.\";return;}",
+        "msg.textContent=\"\";const update={};",
+        "if(xmin!==null&&xmax!==null){update[\"xaxis.range\"]=[xmin,xmax];update[\"xaxis.autorange\"]=false;}else{update[\"xaxis.autorange\"]=true;}",
+        "if(ymin!==null&&ymax!==null){update[\"yaxis.range\"]=[ymin,ymax];update[\"yaxis.autorange\"]=false;}else{update[\"yaxis.autorange\"]=true;}",
+        "Plotly.relayout(plot,update);}",
+        "document.getElementById(\"applyLimitsButton\").onclick=apply;",
+        "document.getElementById(\"applyAxesButton\").onclick=applyAxes;",
+        "document.getElementById(\"autoAxesButton\").onclick=function(){xMin.value=\"\";xMax.value=\"\";yMin.value=\"\";yMax.value=\"\";Plotly.relayout(plot,{\"xaxis.autorange\":true,\"yaxis.autorange\":true});};",
+        "document.getElementById(\"hideLimitsButton\").onclick=function(){Plotly.relayout(plot,{shapes:[],annotations:[]});};",
+        "document.getElementById(\"resetLimitsButton\").onclick=function(){lo.value=originalLower;hi.value=originalUpper;apply();};",
+        "lo.onkeydown=function(e){if(e.key===\"Enter\")apply();};hi.onkeydown=function(e){if(e.key===\"Enter\")apply();};",
+        "})();</script>"
+    ])
+    html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + controls + chart_html + script + "</body></html>"
+    return html.encode("utf-8")
+
 # =====================================================
 # STREAMLIT UI
 # =====================================================
@@ -1251,7 +1319,7 @@ def combine_same_batch_reports(individual_results):
 
 def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
                           show_x_grid, show_y_grid, show_range_slider,
-                          marker_size, marker_opacity, font_family, font_size, show_fill_limits):
+                          marker_size, marker_opacity, font_family, font_size, show_fill_limits, custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max):
     batch_label = result["batch_label"]
     summary_df = result["summary"]
     production_df = result["production"]
@@ -1343,11 +1411,26 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                     scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size, show_fill_limits)
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
+                    if custom_axis_range:
+                        if x_axis_min < x_axis_max:
+                            scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
+                        if y_axis_min < y_axis_max:
+                            scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
                     st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
                                     key=f"fill_scatter_{batch_key}")
                     st.download_button(
                         "Download Interactive Fill-Weight Graph",
-                        figure_to_html_bytes(scatter),
+                        scatter_figure_to_html_bytes(
+                            scatter,
+                            lower_limit,
+                            upper_limit,
+                            font_family,
+                            font_size,
+                            x_axis_min if custom_axis_range else None,
+                            x_axis_max if custom_axis_range else None,
+                            y_axis_min if custom_axis_range else None,
+                            y_axis_max if custom_axis_range else None,
+                        ),
                         file_name=f"{safe_file_stem(batch_label)}_fill_weight.html",
                         mime="text/html", key=f"fill_html_{batch_key}",
                         use_container_width=True,
@@ -1487,6 +1570,12 @@ st.sidebar.header("Graph Settings")
 lower_limit = st.sidebar.number_input("Lower fill-weight limit", value=526.0)
 upper_limit = st.sidebar.number_input("Upper fill-weight limit", value=540.0)
 show_fill_limits = st.sidebar.checkbox("Show lower and upper limits in scatter plot and HTML export", value=True)
+st.sidebar.subheader("Scatter Plot Axis Range")
+custom_axis_range = st.sidebar.checkbox("Use custom X and Y axis limits", value=False)
+x_axis_min = st.sidebar.number_input("X-axis minimum", value=1.0, disabled=not custom_axis_range)
+x_axis_max = st.sidebar.number_input("X-axis maximum", value=1000.0, disabled=not custom_axis_range)
+y_axis_min = st.sidebar.number_input("Y-axis minimum", value=520.0, disabled=not custom_axis_range)
+y_axis_max = st.sidebar.number_input("Y-axis maximum", value=545.0, disabled=not custom_axis_range)
 histogram_bins = st.sidebar.slider("Histogram bins", 5, 60, 20)
 show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
 show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
@@ -1499,6 +1588,12 @@ font_size = st.sidebar.number_input("Font size", min_value=8, max_value=48, valu
 
 if lower_limit >= upper_limit:
     st.error("Lower fill-weight limit must be less than the upper limit.")
+    st.stop()
+if custom_axis_range and x_axis_min >= x_axis_max:
+    st.error("X-axis minimum must be less than X-axis maximum.")
+    st.stop()
+if custom_axis_range and y_axis_min >= y_axis_max:
+    st.error("Y-axis minimum must be less than Y-axis maximum.")
     st.stop()
 
 analyze_clicked = st.button(
@@ -1597,6 +1692,11 @@ excel_name, excel_bytes = render_batch_analysis(
     font_family,
     int(font_size),
     show_fill_limits,
+    custom_axis_range,
+    x_axis_min,
+    x_axis_max,
+    y_axis_min,
+    y_axis_max,
 )
 # render_batch_analysis already provides the selected batch workbook. Do not build
 # every batch workbook and a ZIP automatically on each widget rerun.
@@ -1615,4 +1715,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v16-html-limit-controls")
+    st.caption("Parser version: 2026-10-26-v18-editable-axis-ranges")
