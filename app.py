@@ -688,6 +688,43 @@ def sanitize_alarm_messages(alarm_df):
 
 
 # =====================================================
+# FILL-WEIGHT STATISTICS
+# =====================================================
+def create_fill_weight_statistics(fill_pass_df):
+    columns = ["Pump", "Sample Count", "Average", "Standard Deviation",
+               "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range"]
+    if fill_pass_df is None or fill_pass_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    def add_row(label, values):
+        values = pd.to_numeric(values, errors="coerce").dropna()
+        n = int(values.count())
+        if n == 0:
+            return
+        avg = float(values.mean())
+        sd = float(values.std(ddof=1)) if n > 1 else 0.0
+        rows.append({
+            "Pump": label,
+            "Sample Count": n,
+            "Average": avg,
+            "Standard Deviation": sd,
+            "Relative Standard Deviation (%)": (sd / avg * 100.0) if avg else 0.0,
+            "Minimum": float(values.min()),
+            "Maximum": float(values.max()),
+            "Range": float(values.max() - values.min()),
+        })
+
+    for position in sorted(fill_pass_df["Position"].dropna().unique().tolist()):
+        add_row(f"Pump {int(position)}", fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"])
+    add_row("All Pumps Combined", fill_pass_df["Nett Weight"])
+    result = pd.DataFrame(rows, columns=columns)
+    for col in columns[2:]:
+        result[col] = result[col].round(3)
+    return result
+
+
+# =====================================================
 # SUMMARIES
 # =====================================================
 def create_alarm_summary(alarm_df):
@@ -942,6 +979,7 @@ def analyze_batch_report(pdf_bytes, source_name):
     if not fill_pass_df.empty:
         fill_pass_df = fill_pass_df.sort_values("Timestamp").reset_index(drop=True)
         fill_pass_df["Sample No"] = range(1, len(fill_pass_df) + 1)
+    fill_statistics_df = create_fill_weight_statistics(fill_pass_df)
 
     alarm_frames = [df for df in [safety_df, gmp_df, equipment_df] if not df.empty]
     all_alarms_df = (
@@ -965,6 +1003,7 @@ def analyze_batch_report(pdf_bytes, source_name):
         "production": production_df,
         "fill": fill_df,
         "fill_pass": fill_pass_df,
+        "fill_statistics": fill_statistics_df,
         "safety": safety_df,
         "gmp": gmp_df,
         "equipment": equipment_df,
@@ -984,6 +1023,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
     production_df = result["production"]
     fill_df = result["fill"]
     fill_pass_df = result["fill_pass"]
+    fill_statistics_df = result["fill_statistics"]
     all_alarms_df = result["alarms"]
     alarm_summary_df = result["alarm_summary"]
     audit_df = result["audit"]
@@ -1047,6 +1087,29 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             f2.metric("Mean Nett Weight", f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A")
             f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
+
+            st.subheader("Fill-Weight Statistical Summary by Pump")
+            st.caption("Based only on Weight Passed = 1. RSD (%) = Standard Deviation / Average x 100.")
+            st.dataframe(
+                fill_statistics_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Average": st.column_config.NumberColumn(format="%.3f"),
+                    "Standard Deviation": st.column_config.NumberColumn(format="%.3f"),
+                    "Relative Standard Deviation (%)": st.column_config.NumberColumn(format="%.3f%%"),
+                    "Minimum": st.column_config.NumberColumn(format="%.3f"),
+                    "Maximum": st.column_config.NumberColumn(format="%.3f"),
+                    "Range": st.column_config.NumberColumn(format="%.3f"),
+                },
+            )
+            combined_stats = fill_statistics_df[fill_statistics_df["Pump"].eq("All Pumps Combined")]
+            if not combined_stats.empty:
+                combined = combined_stats.iloc[0]
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("Combined Average", f"{combined['Average']:.3f}")
+                sc2.metric("Combined Standard Deviation", f"{combined['Standard Deviation']:.3f}")
+                sc3.metric("Combined RSD", f"{combined['Relative Standard Deviation (%)']:.3f}%")
 
             choice = st.radio(
                 "Fill-weight table", ["Passed only", "All records"], horizontal=True,
@@ -1160,6 +1223,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
         "Production Counters": production_df,
         "Fill Weight All": fill_df,
         "Fill Weight Passed": fill_pass_df,
+        "Fill Weight Statistics": fill_statistics_df,
         "All Alarms": all_alarms_df,
         "All Alarm Summary": alarm_summary_df,
         "Audit Trail": audit_df,
@@ -1259,4 +1323,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": len(result["pages"]),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-13-v7-multibatch")
+    st.caption("Parser version: 2026-10-26-v8-pump-statistics")
