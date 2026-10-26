@@ -1,5 +1,6 @@
 import re
 import zipfile
+import gc
 from io import BytesIO
 
 import pandas as pd
@@ -19,21 +20,6 @@ st.set_page_config(
     page_title="Batch Report Analyzer",
     layout="wide",
 )
-
-PUMP_COLOR_MAP = {
-    "Pump 1": "#1f77b4",
-    "Pump 2": "#ff7f0e",
-    "Pump 3": "#2ca02c",
-    "Pump 4": "#d62728",
-}
-
-FONT_OPTIONS = [
-    "Times New Roman",
-    "Arial",
-    "Calibri",
-    "Georgia",
-    "Verdana",
-]
 
 
 # =====================================================
@@ -80,51 +66,86 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 # =====================================================
 # PDF TEXT EXTRACTION
 # =====================================================
-@st.cache_data(show_spinner=False)
-def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
+def extract_pdf_pages(pdf_bytes, parser_version="2026-10-26-v13-memory-safe"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
+    raw_parts = []
+    sorted_parts = []
+    audit_section_active = False
 
-    for page_number, page in enumerate(document, start=1):
-        # Unsorted text often preserves report table reading order better.
-        raw_text = page.get_text("text", sort=False) or ""
-        sorted_text = page.get_text("text", sort=True) or ""
-        words = page.get_text("words", sort=True) or []
+    try:
+        for page_number, page in enumerate(document, start=1):
+            raw_text = page.get_text("text", sort=False) or ""
+            sorted_text = page.get_text("text", sort=True) or ""
+            raw_parts.append(raw_text)
+            sorted_parts.append(sorted_text)
+            lower_text = raw_text.lower()
 
-        # Audit Trail pages contain a ruled six-column table. PyMuPDF table
-        # extraction preserves every row much more reliably than whole-page regex.
-        audit_rows = []
-        lower_text = raw_text.lower()
-        if (
-            "userid" in lower_text
-            and "description" in lower_text
-            and "category" in lower_text
-        ):
-            try:
-                table_finder = page.find_tables()
-                for table in table_finder.tables:
-                    extracted = table.extract() or []
-                    if not extracted:
-                        continue
-                    header = [normalize_space(cell) for cell in extracted[0]]
-                    if {"Timestamp", "State", "UserID", "Description", "Comment", "Category"}.issubset(set(header)):
-                        audit_rows.extend(extracted[1:])
-            except Exception:
-                audit_rows = []
+            # Word coordinates are memory-heavy. Keep them only on possible
+            # fill-weight pages where coordinate reconstruction may be needed.
+            fill_candidate = any(
+                marker in lower_text
+                for marker in [
+                    "nett weight", "net weight", "gross weight",
+                    "tare weight", "weight passed",
+                ]
+            )
+            words = page.get_text("words", sort=True) if fill_candidate else []
 
-        pages.append(
-            {
-                "Page": page_number,
-                "Text": raw_text,
-                "Sorted Text": sorted_text,
-                "Words": words,
-                "Audit Rows": audit_rows,
-            }
-        )
+            audit_rows = []
+            has_audit_header = (
+                "userid" in lower_text
+                and "description" in lower_text
+                and "category" in lower_text
+            )
+            if "audit trail" in lower_text or has_audit_header:
+                audit_section_active = True
+            if audit_section_active and any(
+                marker in lower_text
+                for marker in [
+                    "accumulator pressure", "heater temperature",
+                    "load cell trend", "weight trend",
+                ]
+            ):
+                audit_section_active = False
 
-    document.close()
-    full_text = "\n".join(page["Text"] for page in pages)
-    sorted_full_text = "\n".join(page["Sorted Text"] for page in pages)
+            if audit_section_active:
+                try:
+                    for table in page.find_tables().tables:
+                        extracted = table.extract() or []
+                        if not extracted:
+                            continue
+                        first_row = [normalize_space(cell) for cell in extracted[0]]
+                        expected = {
+                            "Timestamp", "State", "UserID",
+                            "Description", "Comment", "Category",
+                        }
+                        if expected.issubset(set(first_row)):
+                            audit_rows.extend(extracted[1:])
+                        elif (
+                            len(first_row) >= 6
+                            and re.search(r"\d{2}/\d{2}/\d{4}", str(first_row[0]))
+                        ):
+                            audit_rows.extend(extracted)
+                except Exception:
+                    audit_rows = []
+
+            # Sorted Text is not retained per page because sorted_full_text below
+            # already contains it. This removes a large duplicate string copy.
+            pages.append(
+                {
+                    "Page": page_number,
+                    "Text": raw_text,
+                    "Words": words,
+                    "Audit Rows": audit_rows,
+                }
+            )
+    finally:
+        document.close()
+
+    full_text = "\n".join(raw_parts)
+    sorted_full_text = "\n".join(sorted_parts)
+    del raw_parts, sorted_parts
     return full_text, sorted_full_text, pages
 
 
@@ -703,80 +724,6 @@ def sanitize_alarm_messages(alarm_df):
 
 
 # =====================================================
-# FILL-WEIGHT STATISTICS
-# =====================================================
-def create_fill_weight_statistics(fill_pass_df, batch_label=None):
-    columns = [
-        "Batch", "Pump", "Sample Count", "Average", "Standard Deviation",
-        "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range",
-    ]
-    if fill_pass_df is None or fill_pass_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    rows = []
-    batch_name = batch_label or ""
-
-    def add_row(pump, values):
-        values = pd.to_numeric(values, errors="coerce").dropna()
-        n = int(values.count())
-        if n == 0:
-            return
-        avg = float(values.mean())
-        sd = float(values.std(ddof=1)) if n > 1 else 0.0
-        rows.append({
-            "Batch": batch_name,
-            "Pump": pump,
-            "Sample Count": n,
-            "Average": avg,
-            "Standard Deviation": sd,
-            "Relative Standard Deviation (%)": (sd / avg * 100.0) if avg else 0.0,
-            "Minimum": float(values.min()),
-            "Maximum": float(values.max()),
-            "Range": float(values.max() - values.min()),
-        })
-
-    for position in sorted(fill_pass_df["Position"].dropna().unique().tolist()):
-        add_row(
-            f"Pump {int(position)}",
-            fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"],
-        )
-    add_row("All Pumps Combined", fill_pass_df["Nett Weight"])
-    result = pd.DataFrame(rows, columns=columns)
-    for column in columns[3:]:
-        result[column] = result[column].round(3)
-    return result
-
-
-def create_all_batches_fill_statistics(results):
-    passed_frames = []
-    individual_frames = []
-    for result in results:
-        passed = result.get("fill_pass", pd.DataFrame()).copy()
-        if passed.empty:
-            continue
-        passed["Batch"] = result["batch_label"]
-        passed_frames.append(passed)
-        individual_frames.append(
-            create_fill_weight_statistics(passed, result["batch_label"])
-        )
-
-    detail = (
-        pd.concat(individual_frames, ignore_index=True)
-        if individual_frames
-        else create_fill_weight_statistics(pd.DataFrame())
-    )
-    if not passed_frames:
-        return detail, detail.copy()
-
-    combined_passed = pd.concat(passed_frames, ignore_index=True)
-    combined = create_fill_weight_statistics(
-        combined_passed,
-        "All Uploaded Batches Combined",
-    )
-    return detail, combined
-
-
-# =====================================================
 # SUMMARIES
 # =====================================================
 def create_alarm_summary(alarm_df):
@@ -832,14 +779,14 @@ def create_audit_user_summary(audit_df):
 # =====================================================
 # PLOTLY FIGURES
 # =====================================================
-def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman", font_size=12):
+def apply_graph_style(fig, title, x_title, y_title):
     fig.update_layout(
         title={"text": title, "x": 0.5, "xanchor": "center"},
         xaxis_title=x_title,
         yaxis_title=y_title,
         template="plotly_white",
-        font=dict(family=font_family, size=font_size),
-        title_font=dict(family=font_family, size=max(font_size + 8, 18)),
+        font=dict(family="Times New Roman", size=12),
+        title_font=dict(family="Times New Roman", size=24),
         legend_title_text="",
         hovermode="closest",
         margin=dict(l=60, r=30, t=80, b=60),
@@ -848,27 +795,24 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family=font_family, size=font_size),
+        title_font=dict(family="Times New Roman", size=12),
     )
     fig.update_yaxes(
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family=font_family, size=font_size),
+        title_font=dict(family="Times New Roman", size=12),
     )
     return fig
 
 
-def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12):
-    plot_df = fill_pass_df.copy()
-    plot_df["Pump"] = plot_df["Position"].map(lambda value: f"Pump {int(value)}")
+def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit):
     fig = px.scatter(
-        plot_df,
+        fill_pass_df,
         x="Sample No",
         y="Nett Weight",
-        color="Pump",
-        color_discrete_map=PUMP_COLOR_MAP,
-        category_orders={"Pump": ["Pump 1", "Pump 2", "Pump 3", "Pump 4"]},
+        color="Position",
+        color_discrete_sequence=px.colors.qualitative.Safe,
         hover_data=[
             "Timestamp",
             "Gross Weight",
@@ -896,12 +840,10 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
         f"{batch_label} - Fill weight data",
         "Sample Number",
         "Nett Weight",
-        font_family,
-        font_size,
     )
 
 
-def make_fill_histogram(fill_pass_df, batch_label, bins, font_family="Times New Roman", font_size=12):
+def make_fill_histogram(fill_pass_df, batch_label, bins):
     fig = px.histogram(
         fill_pass_df,
         x="Nett Weight",
@@ -914,8 +856,6 @@ def make_fill_histogram(fill_pass_df, batch_label, bins, font_family="Times New 
         f"{batch_label} - Fill weight data",
         "Nett Weight",
         "Frequency",
-        font_family,
-        font_size,
     )
 
 
@@ -1052,16 +992,27 @@ def analyze_batch_report(pdf_bytes, source_name):
     if not summary_df.empty:
         batch_number = normalize_space(summary_df.iloc[0].get("Batch Number", ""))
     batch_label = batch_number or safe_file_stem(source_name)
+    page_count = len(pages)
+
+    # Retain the originating report for full traceability after multiple reports
+    # belonging to the same manufacturing batch are combined.
+    for frame in [fill_df, fill_pass_df, safety_df, gmp_df, equipment_df, all_alarms_df, audit_df]:
+        if frame is not None and not frame.empty:
+            frame["Source Report"] = source_name
+
+    # Release PDF page text and word-coordinate structures before the result is
+    # retained. Only structured DataFrames and the page count remain in memory.
+    del full_text, sorted_full_text, pages
+    gc.collect()
 
     return {
         "source_name": source_name,
         "batch_label": batch_label,
-        "pages": pages,
+        "page_count": page_count,
         "summary": summary_df,
         "production": production_df,
         "fill": fill_df,
         "fill_pass": fill_pass_df,
-        "fill_statistics": create_fill_weight_statistics(fill_pass_df, batch_label),
         "safety": safety_df,
         "gmp": gmp_df,
         "equipment": equipment_df,
@@ -1073,15 +1024,134 @@ def analyze_batch_report(pdf_bytes, source_name):
     }
 
 
+def report_root_batch(batch_label):
+    """Return root batch, e.g. EG26051-1 -> EG26051."""
+    value = normalize_space(batch_label)
+    match = re.fullmatch(r"(.+?)-(\d+)", value)
+    return match.group(1) if match else value
+
+
+def combine_same_batch_reports(individual_results):
+    """Combine report parts only when a root batch and/or multiple related parts exist."""
+    labels = [normalize_space(result["batch_label"]) for result in individual_results]
+    roots = {label: report_root_batch(label) for label in labels}
+    root_counts = {}
+    for root in roots.values():
+        root_counts[root] = root_counts.get(root, 0) + 1
+
+    grouped = {}
+    for result in individual_results:
+        label = normalize_space(result["batch_label"])
+        root = roots[label]
+        # A lone suffix batch remains separate. A root with two or more reports is merged.
+        group_key = root if root_counts[root] > 1 else label
+        grouped.setdefault(group_key, []).append(result)
+
+    combined_results = []
+    for group_key, parts in grouped.items():
+        if len(parts) == 1:
+            combined_results.append(parts[0])
+            continue
+
+        source_names = [part["source_name"] for part in parts]
+
+        def combine_frames(key, sort_column=None, drop_duplicates=True):
+            frames = [part[key] for part in parts if part.get(key) is not None and not part[key].empty]
+            if not frames:
+                return pd.DataFrame()
+            frame = pd.concat(frames, ignore_index=True, sort=False)
+            if drop_duplicates:
+                frame = frame.drop_duplicates()
+            if sort_column and sort_column in frame.columns:
+                frame = frame.sort_values(sort_column, na_position="last")
+            return frame.reset_index(drop=True)
+
+        fill_df = combine_frames("fill", "Timestamp", True)
+        fill_pass_df = fill_df[fill_df["Weight Passed"].eq(1)].copy() if not fill_df.empty else pd.DataFrame()
+        if not fill_pass_df.empty:
+            fill_pass_df = fill_pass_df.sort_values("Timestamp").reset_index(drop=True)
+            fill_pass_df["Sample No"] = range(1, len(fill_pass_df) + 1)
+
+        safety_df = combine_frames("safety", "Timestamp", True)
+        gmp_df = combine_frames("gmp", "Timestamp", True)
+        equipment_df = combine_frames("equipment", "Timestamp", True)
+        alarms_df = combine_frames("alarms", "Timestamp", True)
+        # Audit rows are not de-duplicated because repeated printed audit events can be genuine.
+        audit_df = combine_frames("audit", "Timestamp", False)
+
+        # Sum production counters from every report part.
+        production_frames = [part["production"] for part in parts if not part["production"].empty]
+        if production_frames:
+            production_df = pd.concat(production_frames, ignore_index=True, sort=False)
+            group_columns = [column for column in ["Counter Group", "Counter"] if column in production_df.columns]
+            if group_columns and "Value" in production_df.columns:
+                production_df = (
+                    production_df.groupby(group_columns, dropna=False, as_index=False)["Value"]
+                    .sum()
+                )
+        else:
+            production_df = pd.DataFrame()
+
+        # Consolidated summary: earliest start and latest end across report parts.
+        summary_rows = [part["summary"].iloc[0].to_dict() for part in parts if not part["summary"].empty]
+        consolidated = summary_rows[0].copy() if summary_rows else {"Batch Number": group_key}
+        consolidated["Batch Number"] = group_key
+        consolidated["Combined Report Count"] = len(parts)
+        consolidated["Source Reports"] = "; ".join(source_names)
+
+        starts = pd.to_datetime(
+            [row.get("Batch Start", "") for row in summary_rows],
+            dayfirst=True,
+            errors="coerce",
+        )
+        ends = pd.to_datetime(
+            [row.get("Batch End", "") for row in summary_rows],
+            dayfirst=True,
+            errors="coerce",
+        )
+        valid_starts = starts[~pd.isna(starts)]
+        valid_ends = ends[~pd.isna(ends)]
+        if len(valid_starts):
+            consolidated["Batch Start"] = min(valid_starts).strftime("%d/%m/%Y %H:%M:%S")
+        if len(valid_ends):
+            consolidated["Batch End"] = max(valid_ends).strftime("%d/%m/%Y %H:%M:%S")
+        if len(valid_starts) and len(valid_ends):
+            duration = max(valid_ends) - min(valid_starts)
+            total_seconds = int(duration.total_seconds())
+            consolidated["Runtime"] = f"{total_seconds // 3600:02d}:{(total_seconds % 3600) // 60:02d}:{total_seconds % 60:02d}"
+        summary_df = pd.DataFrame([consolidated])
+
+        combined_results.append({
+            "source_name": "; ".join(source_names),
+            "source_reports": source_names,
+            "report_count": len(parts),
+            "batch_label": group_key,
+            "page_count": sum(part.get("page_count", 0) for part in parts),
+            "summary": summary_df,
+            "production": production_df,
+            "fill": fill_df,
+            "fill_pass": fill_pass_df,
+            "safety": safety_df,
+            "gmp": gmp_df,
+            "equipment": equipment_df,
+            "alarms": alarms_df,
+            "alarm_summary": create_alarm_summary(alarms_df),
+            "audit": audit_df,
+            "audit_action_summary": create_audit_action_summary(audit_df),
+            "audit_user_summary": create_audit_user_summary(audit_df),
+        })
+
+    return sorted(combined_results, key=lambda item: item["batch_label"])
+
+
 def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
                           show_x_grid, show_y_grid, show_range_slider,
-                          marker_size, marker_opacity, font_family, font_size):
+                          marker_size, marker_opacity):
     batch_label = result["batch_label"]
     summary_df = result["summary"]
     production_df = result["production"]
     fill_df = result["fill"]
     fill_pass_df = result["fill_pass"]
-    fill_statistics_df = result["fill_statistics"]
     all_alarms_df = result["alarms"]
     alarm_summary_df = result["alarm_summary"]
     audit_df = result["audit"]
@@ -1089,7 +1159,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
     audit_user_summary_df = result["audit_user_summary"]
 
     st.subheader(batch_label)
-    st.caption(f"Source file: {result['source_name']}")
+    st.caption(f"Source report(s): {result['source_name']}")
 
     summary_tab, production_tab, fill_tab, alarms_tab, audit_tab = st.tabs(
         ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail"]
@@ -1109,7 +1179,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
         a1, a2, a3 = st.columns(3)
         a1.metric("All Alarm Events", f"{len(all_alarms_df):,}")
         a2.metric("Audit Records", f"{len(audit_df):,}")
-        a3.metric("PDF Pages", f"{len(result['pages']):,}")
+        a3.metric("PDF Pages", f"{result.get('page_count', 0):,}")
 
     with production_tab:
         if production_df.empty:
@@ -1123,7 +1193,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             plot_df = production_df[production_df["Counter Group"].eq(selected_group)]
             fig = px.bar(plot_df, x="Counter", y="Value", color="Counter", text="Value")
             fig.update_traces(textposition="outside")
-            fig = apply_graph_style(fig, selected_group, "Counter", "Value", font_family, font_size)
+            fig = apply_graph_style(fig, selected_group, "Counter", "Value")
             fig = make_interactive(fig, show_x_grid, show_y_grid, False)
             st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
                             key=f"production_plot_{batch_key}")
@@ -1146,22 +1216,6 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
 
-            st.subheader("Fill-Weight Statistical Summary by Pump")
-            st.caption("Uses only Weight Passed = 1. RSD (%) = Standard Deviation / Average x 100.")
-            st.dataframe(
-                fill_statistics_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Average": st.column_config.NumberColumn(format="%.3f"),
-                    "Standard Deviation": st.column_config.NumberColumn(format="%.3f"),
-                    "Relative Standard Deviation (%)": st.column_config.NumberColumn(format="%.3f%%"),
-                    "Minimum": st.column_config.NumberColumn(format="%.3f"),
-                    "Maximum": st.column_config.NumberColumn(format="%.3f"),
-                    "Range": st.column_config.NumberColumn(format="%.3f"),
-                },
-            )
-
             choice = st.radio(
                 "Fill-weight table", ["Passed only", "All records"], horizontal=True,
                 key=f"fill_table_{batch_key}"
@@ -1177,7 +1231,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 )
                 graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
                 if not graph_df.empty:
-                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size)
+                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit)
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
                     st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
@@ -1190,7 +1244,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                         use_container_width=True,
                     )
 
-                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins, font_family, font_size)
+                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins)
                     histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
                     st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
                                     key=f"histogram_{batch_key}")
@@ -1224,7 +1278,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             if not top.empty:
                 pareto = px.bar(top, x="Occurrences", y="Message", orientation="h",
                                 hover_data=["Code"], color_discrete_sequence=["#d9534f"])
-                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message", font_family, font_size)
+                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message")
                 pareto = make_interactive(pareto, show_x_grid, show_y_grid, False)
                 st.plotly_chart(pareto, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"alarm_pareto_{batch_key}")
@@ -1234,7 +1288,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 timeline_df["Hour"] = timeline_df["Timestamp"].dt.floor("h")
                 counts = timeline_df.groupby(["Hour", "Alarm Type"]).size().reset_index(name="Occurrences")
                 timeline = px.line(counts, x="Hour", y="Occurrences", color="Alarm Type", markers=True)
-                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences", font_family, font_size)
+                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences")
                 timeline = make_interactive(timeline, show_x_grid, show_y_grid, show_range_slider)
                 st.plotly_chart(timeline, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"alarm_timeline_{batch_key}")
@@ -1255,7 +1309,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             if not top_actions.empty:
                 action_fig = px.bar(top_actions, x="Occurrences", y="Action", orientation="h",
                                     color_discrete_sequence=["#5b9bd5"])
-                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action", font_family, font_size)
+                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action")
                 action_fig = make_interactive(action_fig, show_x_grid, show_y_grid, False)
                 st.plotly_chart(action_fig, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"audit_actions_{batch_key}")
@@ -1264,7 +1318,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 user_fig = px.bar(audit_user_summary_df.head(20), x="User", y="Occurrences",
                                   color="User", text="Occurrences")
                 user_fig.update_traces(textposition="outside")
-                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences", font_family, font_size)
+                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences")
                 user_fig = make_interactive(user_fig, show_x_grid, show_y_grid, False)
                 st.plotly_chart(user_fig, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"audit_users_{batch_key}")
@@ -1274,7 +1328,6 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
         "Production Counters": production_df,
         "Fill Weight All": fill_df,
         "Fill Weight Passed": fill_pass_df,
-        "Fill Weight Statistics": fill_statistics_df,
         "All Alarms": all_alarms_df,
         "All Alarm Summary": alarm_summary_df,
         "Audit Trail": audit_df,
@@ -1294,7 +1347,21 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
 # STREAMLIT UI
 # =====================================================
 st.title("Multi-Batch Report Analyzer")
-st.caption("Upload multiple batch-report PDFs. Each batch is extracted and analyzed separately.")
+st.caption("Upload multiple batch-report PDFs. Related report parts are merged by root batch number.")
+st.info(
+    "Memory-safe mode: PDF page text and coordinate data are released immediately "
+    "after structured extraction. Streamlit data caching is disabled."
+)
+if st.sidebar.button("Clear App Data and Cache", type="primary", use_container_width=True):
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    gc.collect()
+    st.rerun()
 
 uploaded_files = st.file_uploader(
     "Upload one or more batch report PDFs",
@@ -1315,19 +1382,6 @@ show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
 show_range_slider = st.sidebar.checkbox("Show X-axis range slider", value=True)
 marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
 marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
-st.sidebar.subheader("Graph Font Settings")
-font_family = st.sidebar.selectbox(
-    "Font type",
-    options=FONT_OPTIONS,
-    index=0,
-)
-font_size = st.sidebar.number_input(
-    "Font size",
-    min_value=8,
-    max_value=48,
-    value=12,
-    step=1,
-)
 
 if lower_limit >= upper_limit:
     st.error("Lower fill-weight limit must be less than the upper limit.")
@@ -1337,8 +1391,11 @@ results = []
 progress = st.progress(0, text="Preparing batch analyses...")
 for index, uploaded in enumerate(uploaded_files):
     try:
-        result = analyze_batch_report(uploaded.getvalue(), uploaded.name)
+        pdf_bytes = uploaded.getvalue()
+        result = analyze_batch_report(pdf_bytes, uploaded.name)
         results.append(result)
+        del pdf_bytes
+        gc.collect()
     except Exception as exc:
         st.error(f"Could not process {uploaded.name}: {exc}")
     progress.progress((index + 1) / len(uploaded_files), text=f"Processed {index + 1} of {len(uploaded_files)} reports")
@@ -1348,79 +1405,51 @@ if not results:
     st.error("None of the uploaded reports could be processed.")
     st.stop()
 
-st.success(f"Completed separate analysis for {len(results)} batch report(s).")
+uploaded_report_count = len(results)
+results = combine_same_batch_reports(results)
+combined_batch_count = len(results)
+merged_group_count = sum(1 for result in results if result.get("report_count", 1) > 1)
 
-batch_statistics_df, all_batches_combined_statistics_df = create_all_batches_fill_statistics(results)
-
-st.header("Fill-Weight Statistical Summary Across Uploaded Batches")
-st.caption(
-    "The first table shows every batch and pump separately. The second table combines "
-    "all passed fill-weight observations from all uploaded reports."
-)
-st.subheader("Batch-wise Pump Statistics")
-st.dataframe(
-    batch_statistics_df,
-    use_container_width=True,
-    hide_index=True,
-)
-st.subheader("All Uploaded Batches Combined")
-st.dataframe(
-    all_batches_combined_statistics_df,
-    use_container_width=True,
-    hide_index=True,
+st.success(
+    f"Processed {uploaded_report_count} report(s) into {combined_batch_count} batch analysis group(s). "
+    f"Merged batch groups: {merged_group_count}."
 )
 
-combined_statistics_excel = build_excel({
-    "Batch Pump Statistics": batch_statistics_df,
-    "All Batches Combined": all_batches_combined_statistics_df,
-})
-st.download_button(
-    "Download Combined Fill-Weight Statistics",
-    data=combined_statistics_excel,
-    file_name="Combined_Fill_Weight_Statistics_All_Batches.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+# Render only one batch at a time. Streamlit tabs execute all tab bodies and can
+# keep every chart in memory, which is unsafe for multiple 300-500 page reports.
+batch_labels = [result["batch_label"] for result in results]
+selected_batch_label = st.selectbox("Batch analysis to display", batch_labels)
+selected_index = batch_labels.index(selected_batch_label)
+selected_result = results[selected_index]
+batch_key = f"batch_{selected_index + 1}_{safe_file_stem(selected_result['source_name'])}"
 
-# A separate top-level tab is created for every uploaded batch.
-batch_tabs = st.tabs([result["batch_label"][:40] for result in results])
-zip_buffer = BytesIO()
-with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr(
-        "Combined_Fill_Weight_Statistics_All_Batches.xlsx",
-        combined_statistics_excel.getvalue(),
-    )
-    for index, (tab, result) in enumerate(zip(batch_tabs, results), start=1):
-        batch_key = f"batch_{index}_{safe_file_stem(result['source_name'])}"
-        with tab:
-            excel_name, excel_bytes = render_batch_analysis(
-                result, batch_key, lower_limit, upper_limit, histogram_bins,
-                show_x_grid, show_y_grid, show_range_slider,
-                marker_size, marker_opacity, font_family, int(font_size),
-            )
-        archive.writestr(excel_name, excel_bytes)
-zip_buffer.seek(0)
-
-st.divider()
-st.download_button(
-    "Download All Batch Excel Reports as ZIP",
-    data=zip_buffer.getvalue(),
-    file_name="All_Batch_Report_Analyses.zip",
-    mime="application/zip",
-    use_container_width=True,
+excel_name, excel_bytes = render_batch_analysis(
+    selected_result,
+    batch_key,
+    lower_limit,
+    upper_limit,
+    histogram_bins,
+    show_x_grid,
+    show_y_grid,
+    show_range_slider,
+    marker_size,
+    marker_opacity,
 )
+# render_batch_analysis already provides the selected batch workbook. Do not build
+# every batch workbook and a ZIP automatically on each widget rerun.
 
 with st.expander("Multi-batch extraction summary"):
     summary_rows = []
     for result in results:
         summary_rows.append({
-            "Source File": result["source_name"],
+            "Source Report(s)": result["source_name"],
+            "Reports Combined": result.get("report_count", 1),
             "Batch": result["batch_label"],
             "Fill Records": len(result["fill"]),
             "Passed Fill Records": len(result["fill_pass"]),
             "Alarm Events": len(result["alarms"]),
             "Audit Records": len(result["audit"]),
-            "PDF Pages": len(result["pages"]),
+            "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v11-colors-combined-stats-fonts")
+    st.caption("Parser version: 2026-10-26-v13-memory-safe")
