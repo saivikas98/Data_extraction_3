@@ -861,7 +861,7 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
     return fig
 
 
-def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12):
+def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12, show_limits=True):
     plot_df = fill_pass_df.copy()
     plot_df["Pump"] = plot_df["Position"].map(lambda value: f"Pump {int(value)}")
     fig = px.scatter(
@@ -879,19 +879,62 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
         ],
     )
     fig.update_traces(marker=dict(size=7, opacity=0.82))
-    fig.add_hline(
-        y=upper_limit,
-        line_width=4,
-        line_color="#9e9e9e",
-        annotation_text=f"Upper limit: {upper_limit:g}",
-        annotation_position="top left",
-    )
-    fig.add_hline(
-        y=lower_limit,
-        line_width=4,
-        line_color="#f28e2b",
-        annotation_text=f"Lower limit: {lower_limit:g}",
-        annotation_position="bottom left",
+    limit_shapes = [
+        dict(
+            type="line", xref="paper", x0=0, x1=1,
+            yref="y", y0=upper_limit, y1=upper_limit,
+            line=dict(color="#9e9e9e", width=4, dash="solid"),
+        ),
+        dict(
+            type="line", xref="paper", x0=0, x1=1,
+            yref="y", y0=lower_limit, y1=lower_limit,
+            line=dict(color="#f28e2b", width=4, dash="solid"),
+        ),
+    ]
+    limit_annotations = [
+        dict(
+            x=0.01, xref="paper", y=upper_limit, yref="y",
+            text=f"Upper limit: {upper_limit:g}", showarrow=False,
+            xanchor="left", yanchor="bottom",
+            font=dict(color="#666666", family=font_family, size=font_size),
+        ),
+        dict(
+            x=0.01, xref="paper", y=lower_limit, yref="y",
+            text=f"Lower limit: {lower_limit:g}", showarrow=False,
+            xanchor="left", yanchor="top",
+            font=dict(color="#c66a00", family=font_family, size=font_size),
+        ),
+    ]
+    if show_limits:
+        fig.update_layout(shapes=limit_shapes, annotations=limit_annotations)
+
+    # These controls are embedded in the standalone HTML export. Users can keep,
+    # hide, or restore the selected lower and upper limits after download.
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                x=1.0,
+                xanchor="right",
+                y=1.16,
+                yanchor="top",
+                showactive=True,
+                buttons=[
+                    dict(
+                        label="Show Limits",
+                        method="relayout",
+                        args=[{"shapes": limit_shapes, "annotations": limit_annotations}],
+                    ),
+                    dict(
+                        label="Hide Limits",
+                        method="relayout",
+                        args=[{"shapes": [], "annotations": []}],
+                    ),
+                ],
+                font=dict(family=font_family, size=font_size),
+            )
+        ]
     )
     return apply_graph_style(
         fig,
@@ -1208,7 +1251,7 @@ def combine_same_batch_reports(individual_results):
 
 def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
                           show_x_grid, show_y_grid, show_range_slider,
-                          marker_size, marker_opacity, font_family, font_size):
+                          marker_size, marker_opacity, font_family, font_size, show_fill_limits):
     batch_label = result["batch_label"]
     summary_df = result["summary"]
     production_df = result["production"]
@@ -1297,7 +1340,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 )
                 graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
                 if not graph_df.empty:
-                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size)
+                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size, show_fill_limits)
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
                     st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
@@ -1443,6 +1486,7 @@ if not uploaded_files:
 st.sidebar.header("Graph Settings")
 lower_limit = st.sidebar.number_input("Lower fill-weight limit", value=526.0)
 upper_limit = st.sidebar.number_input("Upper fill-weight limit", value=540.0)
+show_fill_limits = st.sidebar.checkbox("Show lower and upper limits in scatter plot and HTML export", value=True)
 histogram_bins = st.sidebar.slider("Histogram bins", 5, 60, 20)
 show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
 show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
@@ -1552,6 +1596,7 @@ excel_name, excel_bytes = render_batch_analysis(
     marker_opacity,
     font_family,
     int(font_size),
+    show_fill_limits,
 )
 # render_batch_analysis already provides the selected batch workbook. Do not build
 # every batch workbook and a ZIP automatically on each widget rerun.
@@ -1570,4 +1615,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v15-font-colors-statistics")
+    st.caption("Parser version: 2026-10-26-v16-html-limit-controls")
