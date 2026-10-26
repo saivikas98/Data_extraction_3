@@ -1,5 +1,6 @@
 import re
 import zipfile
+import gc
 from io import BytesIO
 
 import pandas as pd
@@ -19,6 +20,18 @@ st.set_page_config(
     page_title="Batch Report Analyzer",
     layout="wide",
 )
+
+# Fixed colors used consistently for the same pump in every batch and chart.
+PUMP_COLOR_MAP = {
+    1: "#1f77b4",  # blue
+    2: "#ff7f0e",  # orange
+    3: "#2ca02c",  # green
+    4: "#d62728",  # red
+    "1": "#1f77b4",
+    "2": "#ff7f0e",
+    "3": "#2ca02c",
+    "4": "#d62728",
+}
 
 
 # =====================================================
@@ -65,7 +78,6 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 # =====================================================
 # PDF TEXT EXTRACTION
 # =====================================================
-@st.cache_data(show_spinner=False)
 def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
@@ -80,20 +92,34 @@ def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
         # extraction preserves every row much more reliably than whole-page regex.
         audit_rows = []
         lower_text = raw_text.lower()
-        if (
+        has_audit_header = (
             "userid" in lower_text
             and "description" in lower_text
             and "category" in lower_text
+        )
+        if "audit trail" in lower_text or has_audit_header:
+            audit_section_active = True
+        # Trend pages begin after the audit section in this report family.
+        if audit_section_active and any(
+            marker in lower_text
+            for marker in ["accumulator pressure", "heater temperature", "load cell trend"]
         ):
+            audit_section_active = False
+
+        if audit_section_active:
             try:
                 table_finder = page.find_tables()
                 for table in table_finder.tables:
                     extracted = table.extract() or []
                     if not extracted:
                         continue
-                    header = [normalize_space(cell) for cell in extracted[0]]
-                    if {"Timestamp", "State", "UserID", "Description", "Comment", "Category"}.issubset(set(header)):
+                    first_row = [normalize_space(cell) for cell in extracted[0]]
+                    expected = {"Timestamp", "State", "UserID", "Description", "Comment", "Category"}
+                    if expected.issubset(set(first_row)):
                         audit_rows.extend(extracted[1:])
+                    elif len(first_row) >= 6 and re.search(r"\d{2}/\d{2}/\d{4}", str(first_row[0])):
+                        # Continuation page where the PDF table does not repeat headers.
+                        audit_rows.extend(extracted)
             except Exception:
                 audit_rows = []
 
@@ -691,36 +717,42 @@ def sanitize_alarm_messages(alarm_df):
 # FILL-WEIGHT STATISTICS
 # =====================================================
 def create_fill_weight_statistics(fill_pass_df):
-    columns = ["Pump", "Sample Count", "Average", "Standard Deviation",
-               "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range"]
+    columns = [
+        "Pump", "Sample Count", "Average", "Standard Deviation",
+        "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range",
+    ]
     if fill_pass_df is None or fill_pass_df.empty:
         return pd.DataFrame(columns=columns)
 
     rows = []
     def add_row(label, values):
         values = pd.to_numeric(values, errors="coerce").dropna()
-        n = int(values.count())
-        if n == 0:
+        count = int(values.count())
+        if count == 0:
             return
-        avg = float(values.mean())
-        sd = float(values.std(ddof=1)) if n > 1 else 0.0
+        average = float(values.mean())
+        standard_deviation = float(values.std(ddof=1)) if count > 1 else 0.0
+        rsd = standard_deviation / average * 100.0 if average else 0.0
         rows.append({
             "Pump": label,
-            "Sample Count": n,
-            "Average": avg,
-            "Standard Deviation": sd,
-            "Relative Standard Deviation (%)": (sd / avg * 100.0) if avg else 0.0,
+            "Sample Count": count,
+            "Average": average,
+            "Standard Deviation": standard_deviation,
+            "Relative Standard Deviation (%)": rsd,
             "Minimum": float(values.min()),
             "Maximum": float(values.max()),
             "Range": float(values.max() - values.min()),
         })
 
     for position in sorted(fill_pass_df["Position"].dropna().unique().tolist()):
-        add_row(f"Pump {int(position)}", fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"])
+        add_row(
+            f"Pump {int(position)}",
+            fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"],
+        )
     add_row("All Pumps Combined", fill_pass_df["Nett Weight"])
     result = pd.DataFrame(rows, columns=columns)
-    for col in columns[2:]:
-        result[col] = result[col].round(3)
+    for column in columns[2:]:
+        result[column] = result[column].round(3)
     return result
 
 
@@ -813,7 +845,8 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit):
         x="Sample No",
         y="Nett Weight",
         color="Position",
-        color_discrete_sequence=px.colors.qualitative.Safe,
+        color_discrete_map=PUMP_COLOR_MAP,
+        category_orders={"Position": [1, 2, 3, 4]},
         hover_data=[
             "Timestamp",
             "Gross Weight",
@@ -1089,7 +1122,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
 
             st.subheader("Fill-Weight Statistical Summary by Pump")
-            st.caption("Based only on Weight Passed = 1. RSD (%) = Standard Deviation / Average x 100.")
+            st.caption("Uses only Weight Passed = 1. RSD (%) = Standard Deviation / Average x 100.")
             st.dataframe(
                 fill_statistics_df,
                 use_container_width=True,
@@ -1244,6 +1277,21 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
 # =====================================================
 st.title("Multi-Batch Report Analyzer")
 st.caption("Upload multiple batch-report PDFs. Each batch is extracted and analyzed separately.")
+st.info("Privacy mode: uploaded PDFs and extracted data are processed only in the current app run. This app does not write report data to disk and does not use Streamlit data caching.")
+
+if st.sidebar.button("Clear App Data and Cache", type="primary", use_container_width=True):
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    gc.collect()
+    st.rerun()
 
 uploaded_files = st.file_uploader(
     "Upload one or more batch report PDFs",
@@ -1273,8 +1321,11 @@ results = []
 progress = st.progress(0, text="Preparing batch analyses...")
 for index, uploaded in enumerate(uploaded_files):
     try:
-        result = analyze_batch_report(uploaded.getvalue(), uploaded.name)
+        pdf_bytes = uploaded.getvalue()
+        result = analyze_batch_report(pdf_bytes, uploaded.name)
         results.append(result)
+        del pdf_bytes
+        gc.collect()
     except Exception as exc:
         st.error(f"Could not process {uploaded.name}: {exc}")
     progress.progress((index + 1) / len(uploaded_files), text=f"Processed {index + 1} of {len(uploaded_files)} reports")
@@ -1323,4 +1374,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": len(result["pages"]),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v8-pump-statistics")
+    st.caption("Parser version: 2026-10-26-v9-privacy-audit-pump-colors")
