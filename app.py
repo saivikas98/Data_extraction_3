@@ -21,6 +21,14 @@ st.set_page_config(
     layout="wide",
 )
 
+PUMP_COLOR_MAP = {
+    "Pump 1": "#1f77b4",
+    "Pump 2": "#ff7f0e",
+    "Pump 3": "#2ca02c",
+    "Pump 4": "#d62728",
+}
+FONT_OPTIONS = ["Times New Roman", "Arial", "Calibri", "Georgia", "Verdana"]
+
 
 # =====================================================
 # HELPERS
@@ -724,6 +732,53 @@ def sanitize_alarm_messages(alarm_df):
 
 
 # =====================================================
+# FILL-WEIGHT STATISTICS
+# =====================================================
+def create_fill_weight_statistics(fill_pass_df, batch_label=""):
+    columns = ["Batch", "Pump", "Sample Count", "Average", "Standard Deviation",
+               "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range"]
+    if fill_pass_df is None or fill_pass_df.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    def add_row(label, series):
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        n = int(values.count())
+        if not n:
+            return
+        avg = float(values.mean())
+        sd = float(values.std(ddof=1)) if n > 1 else 0.0
+        rows.append({"Batch": batch_label, "Pump": label, "Sample Count": n,
+                     "Average": avg, "Standard Deviation": sd,
+                     "Relative Standard Deviation (%)": (sd / avg * 100) if avg else 0.0,
+                     "Minimum": float(values.min()), "Maximum": float(values.max()),
+                     "Range": float(values.max() - values.min())})
+    for position in sorted(fill_pass_df["Position"].dropna().unique().tolist()):
+        add_row(f"Pump {int(position)}", fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"])
+    add_row("All Pumps Combined", fill_pass_df["Nett Weight"])
+    out = pd.DataFrame(rows, columns=columns)
+    for col in columns[3:]:
+        out[col] = out[col].round(3)
+    return out
+
+
+def create_uploaded_batches_statistics(results):
+    batch_tables = []
+    all_passed = []
+    for result in results:
+        passed = result.get("fill_pass", pd.DataFrame())
+        if passed.empty:
+            continue
+        batch_tables.append(create_fill_weight_statistics(passed, result["batch_label"]))
+        all_passed.append(passed)
+    batch_stats = pd.concat(batch_tables, ignore_index=True) if batch_tables else create_fill_weight_statistics(pd.DataFrame())
+    combined_stats = create_fill_weight_statistics(
+        pd.concat(all_passed, ignore_index=True) if all_passed else pd.DataFrame(),
+        "All Uploaded Batches Combined",
+    )
+    return batch_stats, combined_stats
+
+
+# =====================================================
 # SUMMARIES
 # =====================================================
 def create_alarm_summary(alarm_df):
@@ -779,14 +834,14 @@ def create_audit_user_summary(audit_df):
 # =====================================================
 # PLOTLY FIGURES
 # =====================================================
-def apply_graph_style(fig, title, x_title, y_title):
+def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman", font_size=12):
     fig.update_layout(
         title={"text": title, "x": 0.5, "xanchor": "center"},
         xaxis_title=x_title,
         yaxis_title=y_title,
         template="plotly_white",
-        font=dict(family="Times New Roman", size=12),
-        title_font=dict(family="Times New Roman", size=24),
+        font=dict(family=font_family, size=font_size),
+        title_font=dict(family=font_family, size=max(font_size + 8, 18)),
         legend_title_text="",
         hovermode="closest",
         margin=dict(l=60, r=30, t=80, b=60),
@@ -795,24 +850,27 @@ def apply_graph_style(fig, title, x_title, y_title):
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family="Times New Roman", size=12),
+        title_font=dict(family=font_family, size=font_size),
     )
     fig.update_yaxes(
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family="Times New Roman", size=12),
+        title_font=dict(family=font_family, size=font_size),
     )
     return fig
 
 
-def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit):
+def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12):
+    plot_df = fill_pass_df.copy()
+    plot_df["Pump"] = plot_df["Position"].map(lambda value: f"Pump {int(value)}")
     fig = px.scatter(
-        fill_pass_df,
+        plot_df,
         x="Sample No",
         y="Nett Weight",
-        color="Position",
-        color_discrete_sequence=px.colors.qualitative.Safe,
+        color="Pump",
+        color_discrete_map=PUMP_COLOR_MAP,
+        category_orders={"Pump": ["Pump 1", "Pump 2", "Pump 3", "Pump 4"]},
         hover_data=[
             "Timestamp",
             "Gross Weight",
@@ -840,10 +898,12 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit):
         f"{batch_label} - Fill weight data",
         "Sample Number",
         "Nett Weight",
+        font_family,
+        font_size,
     )
 
 
-def make_fill_histogram(fill_pass_df, batch_label, bins):
+def make_fill_histogram(fill_pass_df, batch_label, bins, font_family="Times New Roman", font_size=12):
     fig = px.histogram(
         fill_pass_df,
         x="Nett Weight",
@@ -856,6 +916,8 @@ def make_fill_histogram(fill_pass_df, batch_label, bins):
         f"{batch_label} - Fill weight data",
         "Nett Weight",
         "Frequency",
+        font_family,
+        font_size,
     )
 
 
@@ -1146,12 +1208,13 @@ def combine_same_batch_reports(individual_results):
 
 def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
                           show_x_grid, show_y_grid, show_range_slider,
-                          marker_size, marker_opacity):
+                          marker_size, marker_opacity, font_family, font_size):
     batch_label = result["batch_label"]
     summary_df = result["summary"]
     production_df = result["production"]
     fill_df = result["fill"]
     fill_pass_df = result["fill_pass"]
+    fill_statistics_df = create_fill_weight_statistics(fill_pass_df, batch_label)
     all_alarms_df = result["alarms"]
     alarm_summary_df = result["alarm_summary"]
     audit_df = result["audit"]
@@ -1193,7 +1256,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             plot_df = production_df[production_df["Counter Group"].eq(selected_group)]
             fig = px.bar(plot_df, x="Counter", y="Value", color="Counter", text="Value")
             fig.update_traces(textposition="outside")
-            fig = apply_graph_style(fig, selected_group, "Counter", "Value")
+            fig = apply_graph_style(fig, selected_group, "Counter", "Value", font_family, font_size)
             fig = make_interactive(fig, show_x_grid, show_y_grid, False)
             st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
                             key=f"production_plot_{batch_key}")
@@ -1215,6 +1278,9 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             f2.metric("Mean Nett Weight", f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A")
             f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
+            st.subheader("Fill-Weight Statistical Summary by Pump")
+            st.caption("Uses passed fill weights only. RSD (%) = Standard Deviation / Average x 100.")
+            st.dataframe(fill_statistics_df, use_container_width=True, hide_index=True)
 
             choice = st.radio(
                 "Fill-weight table", ["Passed only", "All records"], horizontal=True,
@@ -1231,7 +1297,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 )
                 graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
                 if not graph_df.empty:
-                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit)
+                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size)
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
                     st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
@@ -1244,7 +1310,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                         use_container_width=True,
                     )
 
-                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins)
+                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins, font_family, font_size)
                     histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
                     st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
                                     key=f"histogram_{batch_key}")
@@ -1278,7 +1344,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             if not top.empty:
                 pareto = px.bar(top, x="Occurrences", y="Message", orientation="h",
                                 hover_data=["Code"], color_discrete_sequence=["#d9534f"])
-                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message")
+                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message", font_family, font_size)
                 pareto = make_interactive(pareto, show_x_grid, show_y_grid, False)
                 st.plotly_chart(pareto, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"alarm_pareto_{batch_key}")
@@ -1288,7 +1354,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 timeline_df["Hour"] = timeline_df["Timestamp"].dt.floor("h")
                 counts = timeline_df.groupby(["Hour", "Alarm Type"]).size().reset_index(name="Occurrences")
                 timeline = px.line(counts, x="Hour", y="Occurrences", color="Alarm Type", markers=True)
-                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences")
+                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences", font_family, font_size)
                 timeline = make_interactive(timeline, show_x_grid, show_y_grid, show_range_slider)
                 st.plotly_chart(timeline, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"alarm_timeline_{batch_key}")
@@ -1309,7 +1375,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             if not top_actions.empty:
                 action_fig = px.bar(top_actions, x="Occurrences", y="Action", orientation="h",
                                     color_discrete_sequence=["#5b9bd5"])
-                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action")
+                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action", font_family, font_size)
                 action_fig = make_interactive(action_fig, show_x_grid, show_y_grid, False)
                 st.plotly_chart(action_fig, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"audit_actions_{batch_key}")
@@ -1318,7 +1384,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
                 user_fig = px.bar(audit_user_summary_df.head(20), x="User", y="Occurrences",
                                   color="User", text="Occurrences")
                 user_fig.update_traces(textposition="outside")
-                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences")
+                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences", font_family, font_size)
                 user_fig = make_interactive(user_fig, show_x_grid, show_y_grid, False)
                 st.plotly_chart(user_fig, use_container_width=True, config=PLOTLY_CONFIG,
                                 key=f"audit_users_{batch_key}")
@@ -1328,6 +1394,7 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
         "Production Counters": production_df,
         "Fill Weight All": fill_df,
         "Fill Weight Passed": fill_pass_df,
+        "Fill Weight Statistics": fill_statistics_df,
         "All Alarms": all_alarms_df,
         "All Alarm Summary": alarm_summary_df,
         "Audit Trail": audit_df,
@@ -1382,6 +1449,9 @@ show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
 show_range_slider = st.sidebar.checkbox("Show X-axis range slider", value=True)
 marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
 marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
+st.sidebar.subheader("Graph Font Settings")
+font_family = st.sidebar.selectbox("Font type", FONT_OPTIONS, index=0)
+font_size = st.sidebar.number_input("Font size", min_value=8, max_value=48, value=12, step=1)
 
 if lower_limit >= upper_limit:
     st.error("Lower fill-weight limit must be less than the upper limit.")
@@ -1443,6 +1513,24 @@ st.success(
     f"Merged batch groups: {merged_group_count}."
 )
 
+batch_statistics_df, combined_statistics_df = create_uploaded_batches_statistics(results)
+st.header("Fill-Weight Statistical Summary for All Uploaded Batches")
+st.subheader("Batch-wise and Pump-wise Statistics")
+st.dataframe(batch_statistics_df, use_container_width=True, hide_index=True)
+st.subheader("All Uploaded Batches Combined")
+st.dataframe(combined_statistics_df, use_container_width=True, hide_index=True)
+combined_statistics_excel = build_excel({
+    "Batch Pump Statistics": batch_statistics_df,
+    "All Batches Combined": combined_statistics_df,
+})
+st.download_button(
+    "Download Combined Fill-Weight Statistics",
+    data=combined_statistics_excel,
+    file_name="Combined_Fill_Weight_Statistics_All_Batches.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+)
+
 # Render only one batch at a time. Streamlit tabs execute all tab bodies and can
 # keep every chart in memory, which is unsafe for multiple 300-500 page reports.
 batch_labels = [result["batch_label"] for result in results]
@@ -1462,6 +1550,8 @@ excel_name, excel_bytes = render_batch_analysis(
     show_range_slider,
     marker_size,
     marker_opacity,
+    font_family,
+    int(font_size),
 )
 # render_batch_analysis already provides the selected batch workbook. Do not build
 # every batch workbook and a ZIP automatically on each widget rerun.
@@ -1480,4 +1570,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v14-manual-analysis-start")
+    st.caption("Parser version: 2026-10-26-v15-font-colors-statistics")
