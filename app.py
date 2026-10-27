@@ -931,18 +931,24 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
 def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12, show_limits=True):
     plot_df = fill_pass_df.copy()
     plot_df["Pump"] = plot_df["Position"].map(lambda value: f"Pump {int(value)}")
+    plot_df["Record Status"] = plot_df["Weight Passed"].map(
+        {1: "Passed", 0: "Failed"}
+    ).fillna("Unknown")
     fig = px.scatter(
         plot_df,
         x="Sample No",
         y="Nett Weight",
         color="Pump",
+        symbol="Record Status",
         color_discrete_map=PUMP_COLOR_MAP,
-        category_orders={"Pump": ["Pump 1", "Pump 2", "Pump 3", "Pump 4"]},
+        symbol_map={"Passed": "circle", "Failed": "x", "Unknown": "diamond"},
+        category_orders={
+            "Pump": ["Pump 1", "Pump 2", "Pump 3", "Pump 4"],
+            "Record Status": ["Passed", "Failed", "Unknown"],
+        },
         hover_data=[
-            "Timestamp",
-            "Gross Weight",
-            "Tare Weight",
-            "Position",
+            "Timestamp", "Gross Weight", "Tare Weight",
+            "Weight Passed", "Position",
         ],
     )
     fig.update_traces(marker=dict(size=7, opacity=0.82))
@@ -1459,23 +1465,38 @@ def render_batch_analysis(
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
             st.subheader("Fill-Weight Statistical Summary by Pump")
             st.dataframe(fill_statistics_df, use_container_width=True, hide_index=True)
-            table_choice = st.radio(
-                "Fill-weight table", ["Passed only", "All records"], horizontal=True,
-                key=f"fill_table_{batch_key}",
+            record_scope = st.radio(
+                "Fill-weight records for table and plots",
+                ["Passed only", "All records"], horizontal=True,
+                key=f"fill_record_scope_{batch_key}",
             )
-            st.dataframe(fill_pass_df if table_choice == "Passed only" else fill_df,
-                         use_container_width=True, hide_index=True)
+            selected_fill_df = (
+                fill_pass_df if record_scope == "Passed only" else fill_df
+            ).sort_values("Timestamp").reset_index(drop=True).copy()
+            selected_fill_df["Sample No"] = range(1, len(selected_fill_df) + 1)
+            st.dataframe(selected_fill_df, use_container_width=True, hide_index=True)
 
-            if not fill_pass_df.empty:
-                positions = sorted(fill_pass_df["Position"].dropna().unique().tolist())
+            if not selected_fill_df.empty:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Plotted Records", f"{len(selected_fill_df):,}")
+                m2.metric("Passed in Plot", f"{int(selected_fill_df['Weight Passed'].eq(1).sum()):,}")
+                m3.metric("Failed in Plot", f"{int(selected_fill_df['Weight Passed'].eq(0).sum()):,}")
+                positions = sorted(selected_fill_df["Position"].dropna().unique().tolist())
                 selected_positions = st.multiselect(
                     "Pumps to display", positions, default=positions,
                     key=f"positions_{batch_key}",
                 )
-                graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
+                graph_df = selected_fill_df[
+                    selected_fill_df["Position"].isin(selected_positions)
+                ].copy()
                 if not graph_df.empty:
+                    scatter_label = (
+                        f"{batch_label} - Passed Records"
+                        if record_scope == "Passed only"
+                        else f"{batch_label} - All Records"
+                    )
                     scatter = make_fill_scatter(
-                        graph_df, batch_label, lower_limit, upper_limit,
+                        graph_df, scatter_label, lower_limit, upper_limit,
                         font_family, font_size, show_fill_limits,
                     )
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
@@ -1488,7 +1509,7 @@ def render_batch_analysis(
                                     key=f"fill_scatter_{batch_key}")
 
                     histogram = make_fill_histogram(
-                        graph_df, batch_label, histogram_bins, font_family, font_size
+                        graph_df, scatter_label, histogram_bins, font_family, font_size
                     )
                     histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
                     st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
@@ -1758,4 +1779,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v23-dual-fill-formats")
+    st.caption("Parser version: 2026-10-27-v24-all-records-scatter")
