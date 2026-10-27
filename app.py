@@ -1122,7 +1122,11 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
         "})();</script>"
     ])
     html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + controls + chart_html + script + "</body></html>"
-    return html.encode("utf-8")
+    try:
+        return html.encode("utf-8")
+    except Exception:
+        # Never allow an optional HTML export to terminate the Streamlit app.
+        return figure_to_html_bytes(fig)
 
 # =====================================================
 # STREAMLIT UI
@@ -1652,23 +1656,27 @@ st.success(
     f"Merged batch groups: {merged_group_count}."
 )
 
-batch_statistics_df, combined_statistics_df = create_uploaded_batches_statistics(results)
-st.header("Fill-Weight Statistical Summary for All Uploaded Batches")
-st.subheader("Batch-wise and Pump-wise Statistics")
-st.dataframe(batch_statistics_df, use_container_width=True, hide_index=True)
-st.subheader("All Uploaded Batches Combined")
-st.dataframe(combined_statistics_df, use_container_width=True, hide_index=True)
-combined_statistics_excel = build_excel({
-    "Batch Pump Statistics": batch_statistics_df,
-    "All Batches Combined": combined_statistics_df,
-})
-st.download_button(
-    "Download Combined Fill-Weight Statistics",
-    data=combined_statistics_excel,
-    file_name="Combined_Fill_Weight_Statistics_All_Batches.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+try:
+    batch_statistics_df, combined_statistics_df = create_uploaded_batches_statistics(results)
+    st.header("Fill-Weight Statistical Summary for All Uploaded Batches")
+    st.subheader("Batch-wise and Pump-wise Statistics")
+    st.dataframe(batch_statistics_df, use_container_width=True, hide_index=True)
+    st.subheader("All Uploaded Batches Combined")
+    st.dataframe(combined_statistics_df, use_container_width=True, hide_index=True)
+    if st.button("Prepare Combined Statistics Excel", use_container_width=True):
+        combined_statistics_excel = build_excel({
+            "Batch Pump Statistics": batch_statistics_df,
+            "All Batches Combined": combined_statistics_df,
+        })
+        st.download_button(
+            "Download Combined Fill-Weight Statistics",
+            data=combined_statistics_excel,
+            file_name="Combined_Fill_Weight_Statistics_All_Batches.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+except Exception as statistics_error:
+    st.warning(f"Combined statistics could not be displayed: {statistics_error}")
 
 # Render only one batch at a time. Streamlit tabs execute all tab bodies and can
 # keep every chart in memory, which is unsafe for multiple 300-500 page reports.
@@ -1678,26 +1686,32 @@ selected_index = batch_labels.index(selected_batch_label)
 selected_result = results[selected_index]
 batch_key = f"batch_{selected_index + 1}_{safe_file_stem(selected_result['source_name'])}"
 
-excel_name, excel_bytes = render_batch_analysis(
-    selected_result,
-    batch_key,
-    lower_limit,
-    upper_limit,
-    histogram_bins,
-    show_x_grid,
-    show_y_grid,
-    show_range_slider,
-    marker_size,
-    marker_opacity,
-    font_family,
-    int(font_size),
-    show_fill_limits,
-    custom_axis_range,
-    x_axis_min,
-    x_axis_max,
-    y_axis_min,
-    y_axis_max,
-)
+try:
+    excel_name, excel_bytes = render_batch_analysis(
+        selected_result,
+        batch_key,
+        lower_limit,
+        upper_limit,
+        histogram_bins,
+        show_x_grid,
+        show_y_grid,
+        show_range_slider,
+        marker_size,
+        marker_opacity,
+        font_family,
+        int(font_size),
+        show_fill_limits,
+        custom_axis_range,
+        x_axis_min,
+        x_axis_max,
+        y_axis_min,
+        y_axis_max,
+    )
+except Exception as display_error:
+    st.error("The selected batch dashboard could not be rendered.")
+    st.exception(display_error)
+    st.info("Use Clear App Data and Cache, upload the report again, and click Analyze Uploaded Reports.")
+
 # render_batch_analysis already provides the selected batch workbook. Do not build
 # every batch workbook and a ZIP automatically on each widget rerun.
 
@@ -1715,4 +1729,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v18-editable-axis-ranges")
+    st.caption("Parser version: 2026-10-26-v19-crash-contained")
