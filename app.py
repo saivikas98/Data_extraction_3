@@ -1021,8 +1021,12 @@ PLOTLY_CONFIG = {
 
 
 def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=False):
-    # Keep only layout properties supported across older and newer Plotly versions.
-    # Graph editing is enabled through the Plotly config passed to st.plotly_chart.
+    """Apply stable Plotly interaction settings.
+
+    The range-slider property is added only when enabled. Passing an explicit
+    false range-slider update caused a Plotly/Streamlit rerender crash on some
+    Community Cloud environments.
+    """
     fig.update_layout(
         dragmode="zoom",
         hovermode="closest",
@@ -1030,14 +1034,21 @@ def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=
         selectdirection="any",
         uirevision="keep-user-zoom",
     )
-    fig.update_xaxes(
+
+    xaxis_settings = dict(
         showgrid=show_x_grid,
-        rangeslider_visible=show_range_slider,
         showspikes=True,
         spikemode="across",
         spikesnap="cursor",
         spikedash="dot",
     )
+    fig.update_xaxes(**xaxis_settings)
+
+    # A newly generated figure has no range slider by default. Therefore, when
+    # the user selects Off, do not send any range-slider property to Plotly.
+    if bool(show_range_slider):
+        fig.update_xaxes(rangeslider=dict(visible=True))
+
     fig.update_yaxes(
         showgrid=show_y_grid,
         showspikes=True,
@@ -1540,7 +1551,13 @@ y_axis_max = st.sidebar.number_input("Y-axis maximum", value=545.0, disabled=not
 histogram_bins = st.sidebar.slider("Histogram bins", 5, 60, 20)
 show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
 show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
-show_range_slider = st.sidebar.checkbox("Show X-axis range slider", value=True)
+range_slider_mode = st.sidebar.selectbox(
+    "X-axis range slider",
+    options=["Off", "On"],
+    index=0,
+    key="x_axis_range_slider_mode_v2",
+)
+show_range_slider = range_slider_mode == "On"
 marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
 marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
 st.sidebar.subheader("Graph Font Settings")
@@ -1686,4 +1703,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v20-low-memory-sections")
+    st.caption("Parser version: 2026-10-27-v21-stable-range-slider-toggle")
