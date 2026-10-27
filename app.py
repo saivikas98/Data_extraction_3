@@ -874,6 +874,79 @@ def create_audit_user_summary(audit_df):
 
 
 # =====================================================
+# PFS QUANTITY SUMMARY
+# =====================================================
+def get_pfs_quantity_summary(production_df, fill_df):
+    """Return total filled, rejected, and accepted PFS quantities.
+
+    Production counters are the primary source. Extracted fill-weight counts are
+    used only as a fallback when production counters are unavailable.
+    """
+    total_filled = None
+    total_accepted = None
+    total_rejected = None
+
+    if production_df is not None and not production_df.empty:
+        counters = production_df[
+            production_df["Counter Group"].eq("Production Counters")
+        ].copy()
+        if not counters.empty:
+            counter_values = {
+                normalize_space(row["Counter"]).lower(): int(row["Value"])
+                for _, row in counters.iterrows()
+            }
+            total_filled = counter_values.get("infeed (pcs)")
+            total_accepted = counter_values.get("outfeed (pcs)")
+            total_rejected = counter_values.get("reject (pcs)")
+
+    if fill_df is not None and not fill_df.empty:
+        if total_filled is None:
+            total_filled = int(len(fill_df))
+        if total_accepted is None:
+            total_accepted = int(fill_df["Weight Passed"].eq(1).sum())
+        if total_rejected is None:
+            total_rejected = int(fill_df["Weight Passed"].eq(0).sum())
+
+    return {
+        "Total Filled PFS": total_filled if total_filled is not None else 0,
+        "Total Accepted PFS": total_accepted if total_accepted is not None else 0,
+        "Total Rejected PFS": total_rejected if total_rejected is not None else 0,
+    }
+
+
+def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
+    """Add production quantities as outlined black-text boxes above the graph."""
+    positions = [
+        (0.16, "Total Filled PFS", "#eaf2ff"),
+        (0.50, "Total Accepted PFS", "#eaf8ee"),
+        (0.84, "Total Rejected PFS", "#fff0f0"),
+    ]
+    for x_position, label, background in positions:
+        fig.add_annotation(
+            x=x_position,
+            y=1.18,
+            xref="paper",
+            yref="paper",
+            text=f"<b>{label}</b><br>{int(quantities.get(label, 0)):,}",
+            showarrow=False,
+            align="center",
+            xanchor="center",
+            yanchor="middle",
+            font=dict(
+                family=font_family,
+                size=font_size,
+                color="#000000",
+            ),
+            bgcolor=background,
+            bordercolor="#000000",
+            borderwidth=1.5,
+            borderpad=6,
+        )
+    fig.update_layout(margin=dict(l=60, r=30, t=150, b=60))
+    return fig
+
+
+# =====================================================
 # PLOTLY FIGURES
 # =====================================================
 def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman", font_size=12):
@@ -1410,6 +1483,7 @@ def render_batch_analysis(
     audit_action_summary_df = result["audit_action_summary"]
     audit_user_summary_df = result["audit_user_summary"]
     fill_statistics_df = create_fill_weight_statistics(fill_pass_df, batch_label)
+    pfs_quantities = get_pfs_quantity_summary(production_df, fill_df)
 
     st.subheader(batch_label)
     st.caption(f"Source report(s): {result['source_name']}")
@@ -1463,6 +1537,12 @@ def render_batch_analysis(
             f2.metric("Mean", f"{fill_pass_df['Nett Weight'].mean():.3f}" if not fill_pass_df.empty else "N/A")
             f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.3f}" if len(fill_pass_df) > 1 else "N/A")
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
+            st.subheader("PFS Quantity Summary")
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Total Filled PFS", f"{pfs_quantities['Total Filled PFS']:,}")
+            q2.metric("Total Accepted PFS", f"{pfs_quantities['Total Accepted PFS']:,}")
+            q3.metric("Total Rejected PFS", f"{pfs_quantities['Total Rejected PFS']:,}")
+
             st.subheader("Fill-Weight Statistical Summary by Pump")
             st.dataframe(fill_statistics_df, use_container_width=True, hide_index=True)
             record_scope = st.radio(
@@ -1502,6 +1582,12 @@ def render_batch_analysis(
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     # Scatter plot gridlines are intentionally always retained.
                     scatter = make_interactive(scatter, True, True, show_range_slider)
+                    scatter = add_pfs_quantity_annotations(
+                        scatter,
+                        pfs_quantities,
+                        font_family,
+                        font_size,
+                    )
                     if custom_axis_range:
                         scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
                         scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
@@ -1570,6 +1656,9 @@ def render_batch_analysis(
                 "Fill Weight All": fill_df,
                 "Fill Weight Passed": fill_pass_df,
                 "Fill Weight Statistics": fill_statistics_df,
+                "PFS Quantity Summary": pd.DataFrame(
+                    [{"Parameter": key, "Quantity": value} for key, value in pfs_quantities.items()]
+                ),
                 "All Alarms": all_alarms_df,
                 "All Alarm Summary": alarm_summary_df,
                 "Audit Trail": audit_df,
@@ -1779,4 +1868,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v24-all-records-scatter")
+    st.caption("Parser version: 2026-10-27-v25-pfs-quantity-graph")
