@@ -915,34 +915,36 @@ def get_pfs_quantity_summary(production_df, fill_df):
 
 
 def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
-    """Add production quantities as outlined black-text boxes above the graph."""
-    positions = [
-        (0.16, "Total Filled PFS", "#eaf2ff"),
-        (0.50, "Total Accepted PFS", "#eaf8ee"),
-        (0.84, "Total Rejected PFS", "#fff0f0"),
-    ]
-    for x_position, label, background in positions:
-        fig.add_annotation(
-            x=x_position,
-            y=1.18,
-            xref="paper",
-            yref="paper",
-            text=f"<b>{label}</b><br>{int(quantities.get(label, 0)):,}",
-            showarrow=False,
-            align="center",
-            xanchor="center",
-            yanchor="middle",
-            font=dict(
-                family=font_family,
-                size=font_size,
-                color="#000000",
-            ),
-            bgcolor=background,
-            bordercolor="#000000",
-            borderwidth=1.5,
-            borderpad=6,
-        )
-    fig.update_layout(margin=dict(l=60, r=30, t=150, b=60))
+    """Add one compact, bold PFS quantity summary below the graph title."""
+    filled = int(quantities.get("Total Filled PFS", 0))
+    accepted = int(quantities.get("Total Accepted PFS", 0))
+    rejected = int(quantities.get("Total Rejected PFS", 0))
+
+    summary_text = (
+        f"<b>Total Filled PFS: {filled:,}</b>"
+        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+        f"<b>Total Accepted PFS: {accepted:,}</b>"
+        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+        f"<b>Total Rejected PFS: {rejected:,}</b>"
+    )
+
+    fig.add_annotation(
+        x=0.5,
+        y=1.10,
+        xref="paper",
+        yref="paper",
+        text=summary_text,
+        showarrow=False,
+        align="center",
+        xanchor="center",
+        yanchor="middle",
+        font=dict(
+            family=font_family,
+            size=max(int(font_size), 12),
+            color="#000000",
+        ),
+    )
+    fig.update_layout(margin=dict(l=60, r=30, t=120, b=60))
     return fig
 
 
@@ -1868,4 +1870,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v25-pfs-quantity-graph")
+    st.caption("Parser version: 2026-10-27-v26-compact-bold-pfs-summary")
