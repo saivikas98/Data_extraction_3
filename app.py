@@ -300,22 +300,45 @@ def extract_filling_speed(text, sorted_text=""):
 # FILL WEIGHT TABLE
 # =====================================================
 def _parse_fill_weight_stream(text):
+    """Parse both standard and manual-assembly fill-weight row formats.
+
+    Standard format:
+        Date Time Nett Gross Tare Passed AirBubble NeedleBonding Assembly Position
+
+    Manual-assembly format:
+        Date Time Nett Gross Tare Passed Position
+    """
     rows = []
-    # Whitespace includes line breaks, so this handles horizontal and vertically split rows.
-    pattern = re.compile(
+
+    common_prefix = (
         r"(\d{2}/\d{2}/\d{4})\s+"
         r"(\d{2}:\d{2}:\d{2})\s+"
         r"(-?\d+(?:[.,]\d+)?)\s+"
         r"(-?\d+(?:[.,]\d+)?)\s+"
         r"(-?\d+(?:[.,]\d+)?)\s+"
         r"([01])\s+"
-        r"([01-])\s+"
-        r"([01-])\s+"
-        r"([01-])\s+"
-        r"([1-4])(?=\s|$)",
+    )
+
+    # Parse the longer standard format first so it cannot be partially consumed
+    # by the shorter manual-assembly pattern.
+    standard_pattern = re.compile(
+        common_prefix
+        + r"([01-])\s+"
+        + r"([01-])\s+"
+        + r"([01-])\s+"
+        + r"([1-4])(?=\s|$)",
         flags=re.MULTILINE,
     )
-    for match in pattern.finditer(text):
+
+    manual_pattern = re.compile(
+        common_prefix
+        + r"([1-4])(?=\s|$)",
+        flags=re.MULTILINE,
+    )
+
+    occupied_spans = []
+
+    def append_row(match, air_bubble="-", needle_bonding="-", assembly="-", position_group=7):
         values = [match.group(i).replace(",", ".") for i in (3, 4, 5)]
         rows.append(
             {
@@ -324,12 +347,31 @@ def _parse_fill_weight_stream(text):
                 "Gross Weight": float(values[1]),
                 "Tare Weight": float(values[2]),
                 "Weight Passed": int(match.group(6)),
-                "Air Bubble": match.group(7),
-                "Needle Bonding": match.group(8),
-                "Assembly": match.group(9),
-                "Position": int(match.group(10)),
+                "Air Bubble": air_bubble,
+                "Needle Bonding": needle_bonding,
+                "Assembly": assembly,
+                "Position": int(match.group(position_group)),
             }
         )
+
+    for match in standard_pattern.finditer(text):
+        append_row(
+            match,
+            air_bubble=match.group(7),
+            needle_bonding=match.group(8),
+            assembly=match.group(9),
+            position_group=10,
+        )
+        occupied_spans.append(match.span())
+
+    def overlaps_standard(span):
+        return any(span[0] < end and span[1] > start for start, end in occupied_spans)
+
+    for match in manual_pattern.finditer(text):
+        if overlaps_standard(match.span()):
+            continue
+        append_row(match, position_group=7)
+
     return rows
 
 
@@ -372,7 +414,7 @@ def extract_fill_weights(text, sorted_text="", pages=None):
             lower = f"{page.get('Text', '')} {page.get('Sorted Text', '')}".lower()
             is_candidate = any(
                 key in lower
-                for key in ["nett weight", "net weight", "gross weight", "tare weight", "weight passed"]
+                for key in ["nett weight", "net weight", "gross weight", "tare weight", "weight passed", "processed items"]
             )
             if not is_candidate:
                 continue
@@ -1716,4 +1758,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v22-black-outline-grid-no-limit-buttons")
+    st.caption("Parser version: 2026-10-27-v23-dual-fill-formats")
