@@ -840,23 +840,48 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
         xaxis_title=x_title,
         yaxis_title=y_title,
         template="plotly_white",
-        font=dict(family=font_family, size=font_size),
-        title_font=dict(family=font_family, size=max(font_size + 8, 18)),
+        font=dict(family=font_family, size=font_size, color="#000000"),
+        title_font=dict(
+            family=font_family,
+            size=max(font_size + 8, 18),
+            color="#000000",
+        ),
         legend_title_text="",
+        legend=dict(font=dict(color="#000000")),
         hovermode="closest",
         margin=dict(l=60, r=30, t=80, b=60),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
     )
     fig.update_xaxes(
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family=font_family, size=font_size),
+        griddash="solid",
+        showline=True,
+        linecolor="#000000",
+        linewidth=2,
+        mirror=True,
+        ticks="outside",
+        tickcolor="#000000",
+        tickfont=dict(color="#000000"),
+        title_font=dict(family=font_family, size=font_size, color="#000000"),
+        zeroline=False,
     )
     fig.update_yaxes(
         showgrid=True,
         gridcolor="#b8b8b8",
         gridwidth=1,
-        title_font=dict(family=font_family, size=font_size),
+        griddash="solid",
+        showline=True,
+        linecolor="#000000",
+        linewidth=2,
+        mirror=True,
+        ticks="outside",
+        tickcolor="#000000",
+        tickfont=dict(color="#000000"),
+        title_font=dict(family=font_family, size=font_size, color="#000000"),
+        zeroline=False,
     )
     return fig
 
@@ -896,46 +921,18 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
             x=0.01, xref="paper", y=upper_limit, yref="y",
             text=f"Upper limit: {upper_limit:g}", showarrow=False,
             xanchor="left", yanchor="bottom",
-            font=dict(color="#666666", family=font_family, size=font_size),
+            font=dict(color="#000000", family=font_family, size=font_size),
         ),
         dict(
             x=0.01, xref="paper", y=lower_limit, yref="y",
             text=f"Lower limit: {lower_limit:g}", showarrow=False,
             xanchor="left", yanchor="top",
-            font=dict(color="#c66a00", family=font_family, size=font_size),
+            font=dict(color="#000000", family=font_family, size=font_size),
         ),
     ]
     if show_limits:
         fig.update_layout(shapes=limit_shapes, annotations=limit_annotations)
 
-    # These controls are embedded in the standalone HTML export. Users can keep,
-    # hide, or restore the selected lower and upper limits after download.
-    fig.update_layout(
-        updatemenus=[
-            dict(
-                type="buttons",
-                direction="right",
-                x=1.0,
-                xanchor="right",
-                y=1.16,
-                yanchor="top",
-                showactive=True,
-                buttons=[
-                    dict(
-                        label="Show Limits",
-                        method="relayout",
-                        args=[{"shapes": limit_shapes, "annotations": limit_annotations}],
-                    ),
-                    dict(
-                        label="Hide Limits",
-                        method="relayout",
-                        args=[{"shapes": [], "annotations": []}],
-                    ),
-                ],
-                font=dict(family=font_family, size=font_size),
-            )
-        ]
-    )
     return apply_graph_style(
         fig,
         f"{batch_label} - Fill weight data",
@@ -1084,7 +1081,7 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
     controls = (
         "<div style=\"font-family:" + safe_font + ";font-size:" + size + "px;padding:12px 16px;"
         "border:1px solid #d9d9d9;border-radius:8px;margin:10px 0;display:flex;gap:14px;"
-        "align-items:end;flex-wrap:wrap;background:#fafafa;\">"
+        "align-items:end;flex-wrap:wrap;background:#fafafa;color:#000000;\">"
         "<label>Lower fill-weight limit<br><input id=\"lowerLimitInput\" type=\"number\" step=\"0.1\" value=\"" + lower + "\"></label>"
         "<label>Upper fill-weight limit<br><input id=\"upperLimitInput\" type=\"number\" step=\"0.1\" value=\"" + upper + "\"></label>"
         "<label>X-axis minimum<br><input id=\"xMinInput\" type=\"number\" step=\"1\" value=\"" + initial_x_min + "\"></label>"
@@ -1094,7 +1091,6 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
         "<button id=\"applyLimitsButton\">Apply Limits</button>"
         "<button id=\"applyAxesButton\">Apply Axis Range</button>"
         "<button id=\"autoAxesButton\">Auto Axis Range</button>"
-        "<button id=\"hideLimitsButton\">Hide Limits</button>"
         "<button id=\"resetLimitsButton\">Reset Original Limits</button>"
         "<span id=\"limitMessage\" style=\"color:#b00020;\"></span></div>"
     )
@@ -1127,12 +1123,28 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
         "document.getElementById(\"applyLimitsButton\").onclick=apply;",
         "document.getElementById(\"applyAxesButton\").onclick=applyAxes;",
         "document.getElementById(\"autoAxesButton\").onclick=function(){xMin.value=\"\";xMax.value=\"\";yMin.value=\"\";yMax.value=\"\";Plotly.relayout(plot,{\"xaxis.autorange\":true,\"yaxis.autorange\":true});};",
-        "document.getElementById(\"hideLimitsButton\").onclick=function(){Plotly.relayout(plot,{shapes:[],annotations:[]});};",
         "document.getElementById(\"resetLimitsButton\").onclick=function(){lo.value=originalLower;hi.value=originalUpper;apply();};",
         "lo.onkeydown=function(e){if(e.key===\"Enter\")apply();};hi.onkeydown=function(e){if(e.key===\"Enter\")apply();};",
         "})();</script>"
     ])
-    html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + controls + chart_html + script + "</body></html>"
+    control_css = (
+        "<style>body{color:#000;background:#fff;}"
+        "label{color:#000;font-weight:600;}"
+        "input,button{color:#000;background:#fff;border:1.5px solid #000;"
+        "border-radius:4px;padding:6px 10px;font-family:" + safe_font + ";"
+        "font-size:" + size + "px;}"
+        "button{cursor:pointer;font-weight:600;}"
+        "</style>"
+    )
+    html = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        + control_css
+        + "</head><body>"
+        + controls
+        + chart_html
+        + script
+        + "</body></html>"
+    )
     try:
         return html.encode("utf-8")
     except Exception:
@@ -1425,7 +1437,8 @@ def render_batch_analysis(
                         font_family, font_size, show_fill_limits,
                     )
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
-                    scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
+                    # Scatter plot gridlines are intentionally always retained.
+                    scatter = make_interactive(scatter, True, True, show_range_slider)
                     if custom_axis_range:
                         scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
                         scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
@@ -1703,4 +1716,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v21-stable-range-slider-toggle")
+    st.caption("Parser version: 2026-10-27-v22-black-outline-grid-no-limit-buttons")
