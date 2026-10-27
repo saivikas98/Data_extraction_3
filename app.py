@@ -1051,7 +1051,7 @@ def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=
 def figure_to_html_bytes(fig):
     return fig.to_html(
         full_html=True,
-        include_plotlyjs=True,
+        include_plotlyjs="cdn",
         config=PLOTLY_CONFIG,
     ).encode("utf-8")
 
@@ -1060,7 +1060,7 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
     """Create standalone HTML with editable lower and upper limit inputs."""
     div_id = "fill_weight_scatter"
     chart_html = fig.to_html(
-        full_html=False, include_plotlyjs=True, config=PLOTLY_CONFIG, div_id=div_id
+        full_html=False, include_plotlyjs="cdn", config=PLOTLY_CONFIG, div_id=div_id
     )
     safe_font = str(font_family).replace("\'", "")
     size = str(int(font_size))
@@ -1321,29 +1321,36 @@ def combine_same_batch_reports(individual_results):
     return sorted(combined_results, key=lambda item: item["batch_label"])
 
 
-def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram_bins,
-                          show_x_grid, show_y_grid, show_range_slider,
-                          marker_size, marker_opacity, font_family, font_size, show_fill_limits, custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max):
+def render_batch_analysis(
+    result, batch_key, lower_limit, upper_limit, histogram_bins,
+    show_x_grid, show_y_grid, show_range_slider, marker_size,
+    marker_opacity, font_family, font_size, show_fill_limits,
+    custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max,
+):
+    """Render only the selected section to keep Streamlit Cloud memory stable."""
     batch_label = result["batch_label"]
     summary_df = result["summary"]
     production_df = result["production"]
     fill_df = result["fill"]
     fill_pass_df = result["fill_pass"]
-    fill_statistics_df = create_fill_weight_statistics(fill_pass_df, batch_label)
     all_alarms_df = result["alarms"]
     alarm_summary_df = result["alarm_summary"]
     audit_df = result["audit"]
     audit_action_summary_df = result["audit_action_summary"]
     audit_user_summary_df = result["audit_user_summary"]
+    fill_statistics_df = create_fill_weight_statistics(fill_pass_df, batch_label)
 
     st.subheader(batch_label)
     st.caption(f"Source report(s): {result['source_name']}")
 
-    summary_tab, production_tab, fill_tab, alarms_tab, audit_tab = st.tabs(
-        ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail"]
+    section = st.radio(
+        "Analysis section",
+        ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail", "Downloads"],
+        horizontal=True,
+        key=f"section_{batch_key}",
     )
 
-    with summary_tab:
+    if section == "Summary":
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
         total = len(fill_df)
         passed = len(fill_pass_df)
@@ -1359,9 +1366,9 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
         a2.metric("Audit Records", f"{len(audit_df):,}")
         a3.metric("PDF Pages", f"{result.get('page_count', 0):,}")
 
-    with production_tab:
+    elif section == "Production":
         if production_df.empty:
-            st.warning("No structured production counters were detected for this batch.")
+            st.warning("No structured production counters were detected.")
         else:
             st.dataframe(production_df, use_container_width=True, hide_index=True)
             groups = production_df["Counter Group"].drop_duplicates().tolist()
@@ -1375,169 +1382,119 @@ def render_batch_analysis(result, batch_key, lower_limit, upper_limit, histogram
             fig = make_interactive(fig, show_x_grid, show_y_grid, False)
             st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
                             key=f"production_plot_{batch_key}")
-            st.download_button(
-                "Download Interactive Production Chart",
-                figure_to_html_bytes(fig),
-                file_name=f"{safe_file_stem(batch_label)}_production.html",
-                mime="text/html",
-                key=f"production_html_{batch_key}",
-                use_container_width=True,
-            )
 
-    with fill_tab:
+    elif section == "Fill Weight":
         if fill_df.empty:
-            st.warning("No fill-weight records were detected for this batch.")
+            st.warning("No fill-weight records were detected.")
         else:
             f1, f2, f3, f4 = st.columns(4)
             f1.metric("Passed Records", f"{len(fill_pass_df):,}")
-            f2.metric("Mean Nett Weight", f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A")
-            f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
+            f2.metric("Mean", f"{fill_pass_df['Nett Weight'].mean():.3f}" if not fill_pass_df.empty else "N/A")
+            f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.3f}" if len(fill_pass_df) > 1 else "N/A")
             f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
             st.subheader("Fill-Weight Statistical Summary by Pump")
-            st.caption("Uses passed fill weights only. RSD (%) = Standard Deviation / Average x 100.")
             st.dataframe(fill_statistics_df, use_container_width=True, hide_index=True)
-
-            choice = st.radio(
+            table_choice = st.radio(
                 "Fill-weight table", ["Passed only", "All records"], horizontal=True,
-                key=f"fill_table_{batch_key}"
+                key=f"fill_table_{batch_key}",
             )
-            st.dataframe(fill_pass_df if choice == "Passed only" else fill_df,
+            st.dataframe(fill_pass_df if table_choice == "Passed only" else fill_df,
                          use_container_width=True, hide_index=True)
 
-            if not fill_pass_df.empty and lower_limit < upper_limit:
+            if not fill_pass_df.empty:
                 positions = sorted(fill_pass_df["Position"].dropna().unique().tolist())
                 selected_positions = st.multiselect(
-                    "Positions to display", positions, default=positions,
-                    key=f"positions_{batch_key}"
+                    "Pumps to display", positions, default=positions,
+                    key=f"positions_{batch_key}",
                 )
                 graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)]
                 if not graph_df.empty:
-                    scatter = make_fill_scatter(graph_df, batch_label, lower_limit, upper_limit, font_family, font_size, show_fill_limits)
+                    scatter = make_fill_scatter(
+                        graph_df, batch_label, lower_limit, upper_limit,
+                        font_family, font_size, show_fill_limits,
+                    )
                     scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
                     scatter = make_interactive(scatter, show_x_grid, show_y_grid, show_range_slider)
                     if custom_axis_range:
-                        if x_axis_min < x_axis_max:
-                            scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
-                        if y_axis_min < y_axis_max:
-                            scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
+                        scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
+                        scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
                     st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
                                     key=f"fill_scatter_{batch_key}")
-                    st.download_button(
-                        "Download Interactive Fill-Weight Graph",
-                        scatter_figure_to_html_bytes(
-                            scatter,
-                            lower_limit,
-                            upper_limit,
-                            font_family,
-                            font_size,
+
+                    histogram = make_fill_histogram(
+                        graph_df, batch_label, histogram_bins, font_family, font_size
+                    )
+                    histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
+                    st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
+                                    key=f"histogram_{batch_key}")
+
+                    if st.button("Prepare Interactive Scatter HTML", key=f"prep_html_{batch_key}"):
+                        html_bytes = scatter_figure_to_html_bytes(
+                            scatter, lower_limit, upper_limit, font_family, font_size,
                             x_axis_min if custom_axis_range else None,
                             x_axis_max if custom_axis_range else None,
                             y_axis_min if custom_axis_range else None,
                             y_axis_max if custom_axis_range else None,
-                        ),
-                        file_name=f"{safe_file_stem(batch_label)}_fill_weight.html",
-                        mime="text/html", key=f"fill_html_{batch_key}",
-                        use_container_width=True,
-                    )
+                        )
+                        st.download_button(
+                            "Download Interactive Scatter HTML", html_bytes,
+                            file_name=f"{safe_file_stem(batch_label)}_fill_weight.html",
+                            mime="text/html", key=f"html_download_{batch_key}",
+                            use_container_width=True,
+                        )
 
-                    histogram = make_fill_histogram(graph_df, batch_label, histogram_bins, font_family, font_size)
-                    histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
-                    st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
-                                    key=f"histogram_{batch_key}")
-                    st.download_button(
-                        "Download Interactive Histogram",
-                        figure_to_html_bytes(histogram),
-                        file_name=f"{safe_file_stem(batch_label)}_histogram.html",
-                        mime="text/html", key=f"hist_html_{batch_key}",
-                        use_container_width=True,
-                    )
-
-    with alarms_tab:
+    elif section == "All Alarms":
         if all_alarms_df.empty:
-            st.warning("No structured alarm records were detected for this batch.")
+            st.warning("No structured alarm records were detected.")
         else:
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Total Alarm Events", f"{len(all_alarms_df):,}")
             c2.metric("Unique Alarm Types", f"{len(alarm_summary_df):,}")
             c3.metric("Repeated Alarm Types", f"{int((alarm_summary_df['Occurrences'] > 1).sum()):,}")
-            c4.metric("Alarm Categories", f"{all_alarms_df['Alarm Type'].nunique():,}")
-
-            categories = sorted(all_alarms_df["Alarm Type"].dropna().unique().tolist())
-            chosen = st.multiselect("Alarm categories", categories, default=categories,
-                                    key=f"alarm_categories_{batch_key}")
-            filtered = all_alarms_df[all_alarms_df["Alarm Type"].isin(chosen)]
-            st.dataframe(filtered, use_container_width=True, hide_index=True)
-            filtered_summary = create_alarm_summary(filtered)
-            st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
-
-            top = filtered_summary.head(20).sort_values("Occurrences")
+            st.dataframe(all_alarms_df, use_container_width=True, hide_index=True)
+            st.subheader("Alarm Frequency Summary")
+            st.dataframe(alarm_summary_df, use_container_width=True, hide_index=True)
+            top = alarm_summary_df.head(20).sort_values("Occurrences")
             if not top.empty:
-                pareto = px.bar(top, x="Occurrences", y="Message", orientation="h",
-                                hover_data=["Code"], color_discrete_sequence=["#d9534f"])
-                pareto = apply_graph_style(pareto, "Top Alarms by Frequency", "Occurrences", "Alarm Message", font_family, font_size)
-                pareto = make_interactive(pareto, show_x_grid, show_y_grid, False)
-                st.plotly_chart(pareto, use_container_width=True, config=PLOTLY_CONFIG,
-                                key=f"alarm_pareto_{batch_key}")
+                fig = px.bar(top, x="Occurrences", y="Message", orientation="h")
+                fig = apply_graph_style(fig, "Top Alarms", "Occurrences", "Alarm Message", font_family, font_size)
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
+                                key=f"alarm_plot_{batch_key}")
 
-            timeline_df = filtered.dropna(subset=["Timestamp"]).copy()
-            if not timeline_df.empty:
-                timeline_df["Hour"] = timeline_df["Timestamp"].dt.floor("h")
-                counts = timeline_df.groupby(["Hour", "Alarm Type"]).size().reset_index(name="Occurrences")
-                timeline = px.line(counts, x="Hour", y="Occurrences", color="Alarm Type", markers=True)
-                timeline = apply_graph_style(timeline, "Alarm Events Over Time", "Time", "Occurrences", font_family, font_size)
-                timeline = make_interactive(timeline, show_x_grid, show_y_grid, show_range_slider)
-                st.plotly_chart(timeline, use_container_width=True, config=PLOTLY_CONFIG,
-                                key=f"alarm_timeline_{batch_key}")
-
-    with audit_tab:
+    elif section == "Audit Trail":
         if audit_df.empty:
-            st.warning("No structured audit-trail records were detected for this batch.")
+            st.warning("No structured audit-trail records were detected.")
         else:
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Audit Records", f"{len(audit_df):,}")
             c2.metric("Unique Actions", f"{len(audit_action_summary_df):,}")
-            c3.metric("Repeated Actions", f"{int((audit_action_summary_df['Occurrences'] > 1).sum()):,}")
+            c3.metric("Users", f"{len(audit_user_summary_df):,}")
             st.dataframe(audit_df, use_container_width=True, hide_index=True)
             st.subheader("Audit Action Frequency Summary")
             st.dataframe(audit_action_summary_df, use_container_width=True, hide_index=True)
 
-            top_actions = audit_action_summary_df.head(20).sort_values("Occurrences")
-            if not top_actions.empty:
-                action_fig = px.bar(top_actions, x="Occurrences", y="Action", orientation="h",
-                                    color_discrete_sequence=["#5b9bd5"])
-                action_fig = apply_graph_style(action_fig, "Top Audit Actions", "Occurrences", "Audit Action", font_family, font_size)
-                action_fig = make_interactive(action_fig, show_x_grid, show_y_grid, False)
-                st.plotly_chart(action_fig, use_container_width=True, config=PLOTLY_CONFIG,
-                                key=f"audit_actions_{batch_key}")
-
-            if not audit_user_summary_df.empty:
-                user_fig = px.bar(audit_user_summary_df.head(20), x="User", y="Occurrences",
-                                  color="User", text="Occurrences")
-                user_fig.update_traces(textposition="outside")
-                user_fig = apply_graph_style(user_fig, "Audit Records by User", "User", "Occurrences", font_family, font_size)
-                user_fig = make_interactive(user_fig, show_x_grid, show_y_grid, False)
-                st.plotly_chart(user_fig, use_container_width=True, config=PLOTLY_CONFIG,
-                                key=f"audit_users_{batch_key}")
-
-    excel_file = build_excel({
-        "Batch Summary": summary_df,
-        "Production Counters": production_df,
-        "Fill Weight All": fill_df,
-        "Fill Weight Passed": fill_pass_df,
-        "Fill Weight Statistics": fill_statistics_df,
-        "All Alarms": all_alarms_df,
-        "All Alarm Summary": alarm_summary_df,
-        "Audit Trail": audit_df,
-        "Audit Action Summary": audit_action_summary_df,
-        "Audit User Summary": audit_user_summary_df,
-    })
-    excel_name = f"{safe_file_stem(batch_label)}_Batch_Report_Analysis.xlsx"
-    st.download_button(
-        "Download This Batch Excel Report", excel_file, file_name=excel_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"excel_{batch_key}", use_container_width=True,
-    )
-    return excel_name, excel_file.getvalue()
+    elif section == "Downloads":
+        st.caption("Excel is generated only when requested to avoid repeated memory spikes.")
+        if st.button("Prepare Batch Excel Report", key=f"prep_excel_{batch_key}",
+                     use_container_width=True):
+            excel_file = build_excel({
+                "Batch Summary": summary_df,
+                "Production Counters": production_df,
+                "Fill Weight All": fill_df,
+                "Fill Weight Passed": fill_pass_df,
+                "Fill Weight Statistics": fill_statistics_df,
+                "All Alarms": all_alarms_df,
+                "All Alarm Summary": alarm_summary_df,
+                "Audit Trail": audit_df,
+                "Audit Action Summary": audit_action_summary_df,
+                "Audit User Summary": audit_user_summary_df,
+            })
+            st.download_button(
+                "Download This Batch Excel Report", excel_file,
+                file_name=f"{safe_file_stem(batch_label)}_Batch_Report_Analysis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"excel_{batch_key}", use_container_width=True,
+            )
 
 
 # =====================================================
@@ -1687,7 +1644,7 @@ selected_result = results[selected_index]
 batch_key = f"batch_{selected_index + 1}_{safe_file_stem(selected_result['source_name'])}"
 
 try:
-    excel_name, excel_bytes = render_batch_analysis(
+    render_batch_analysis(
         selected_result,
         batch_key,
         lower_limit,
@@ -1729,4 +1686,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-26-v19-crash-contained")
+    st.caption("Parser version: 2026-10-27-v20-low-memory-sections")
