@@ -930,7 +930,7 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
 
     fig.add_annotation(
         x=0.5,
-        y=1.15,
+        y=1.095,
         xref="paper",
         yref="paper",
         text=summary_text,
@@ -944,7 +944,7 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
             color="#000000",
         ),
     )
-    fig.update_layout(margin=dict(l=70, r=40, t=210, b=75))
+    fig.update_layout(margin=dict(l=70, r=40, t=170, b=75))
     return fig
 
 
@@ -1033,7 +1033,7 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
             orientation="h",
             x=0.5,
             xanchor="center",
-            y=1.065,
+            y=1.035,
             yanchor="bottom",
             font=dict(
                 family=font_family,
@@ -1089,11 +1089,11 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
             text=f"{batch_label} - Fill weight data",
             x=0.5,
             xanchor="center",
-            y=0.985,
+            y=0.975,
             yanchor="top",
             pad=dict(t=0, b=0),
         ),
-        margin=dict(l=70, r=40, t=210, b=75),
+        margin=dict(l=70, r=40, t=170, b=75),
     )
     return fig
 
@@ -1902,4 +1902,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-28-v28-separated-header-number-of-pfs")
+    st.caption("Parser version: 2026-10-28-v29-compact-title-summary-legend")
