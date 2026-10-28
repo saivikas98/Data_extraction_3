@@ -944,7 +944,7 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
             color="#000000",
         ),
     )
-    fig.update_layout(margin=dict(l=60, r=30, t=120, b=60))
+    fig.update_layout(margin=dict(l=60, r=30, t=155, b=60))
     return fig
 
 
@@ -1027,6 +1027,25 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
         ],
     )
     fig.update_traces(marker=dict(size=7, opacity=0.82))
+    # Keep the pump/status legend in one horizontal row below the summary line.
+    fig.update_layout(
+        legend=dict(
+            orientation="h",
+            x=0.5,
+            xanchor="center",
+            y=1.02,
+            yanchor="bottom",
+            font=dict(
+                family=font_family,
+                size=font_size,
+                color="#000000",
+            ),
+            bgcolor="rgba(255,255,255,0)",
+            borderwidth=0,
+            itemsizing="constant",
+            tracegroupgap=8,
+        )
+    )
     limit_shapes = [
         dict(
             type="line", xref="paper", x0=0, x1=1,
@@ -1870,5 +1889,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-27-v26-compact-bold-pfs-summary")
-
+    st.caption("Parser version: 2026-10-28-v27-horizontal-scatter-legend")
