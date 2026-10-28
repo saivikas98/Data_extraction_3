@@ -1,8 +1,10 @@
 import re
 import zipfile
 import gc
+import math
 from io import BytesIO
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -1098,22 +1100,80 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
     return fig
 
 
-def make_fill_histogram(fill_pass_df, batch_label, bins, font_family="Times New Roman", font_size=12):
-    fig = px.histogram(
-        fill_pass_df,
-        x="Nett Weight",
-        nbins=bins,
-        color_discrete_sequence=["#5b9bd5"],
+def make_fill_histogram(
+    fill_data,
+    batch_label,
+    bin_width=5.0,
+    font_family="Times New Roman",
+    font_size=12,
+):
+    """Create a frequency chart with readable X-axis ranges such as 525-530 mg."""
+    plot_df = fill_data.copy()
+    weights = pd.to_numeric(plot_df["Nett Weight"], errors="coerce").dropna()
+
+    if weights.empty:
+        return apply_graph_style(
+            px.bar(pd.DataFrame({"Weight Range": [], "Frequency": []})),
+            f"{batch_label} - Fill weight data",
+            "Nett Weight Range (mg)",
+            "Frequency",
+            font_family,
+            font_size,
+        )
+
+    bin_width = max(float(bin_width), 0.1)
+    minimum_edge = math.floor(float(weights.min()) / bin_width) * bin_width
+    maximum_edge = math.ceil(float(weights.max()) / bin_width) * bin_width
+    if maximum_edge <= minimum_edge:
+        maximum_edge = minimum_edge + bin_width
+
+    edges = np.arange(minimum_edge, maximum_edge + bin_width * 0.001, bin_width)
+    if len(edges) < 2:
+        edges = np.array([minimum_edge, minimum_edge + bin_width])
+
+    def format_edge(value):
+        return f"{value:.0f}" if float(value).is_integer() else f"{value:g}"
+
+    labels = [
+        f"{format_edge(edges[index])}-{format_edge(edges[index + 1])}"
+        for index in range(len(edges) - 1)
+    ]
+    categories = pd.cut(
+        weights,
+        bins=edges,
+        labels=labels,
+        include_lowest=True,
+        right=False,
     )
-    fig.update_traces(marker_line_color="white", marker_line_width=0.6)
-    return apply_graph_style(
+    counts = categories.value_counts(sort=False).reindex(labels, fill_value=0)
+    frequency_df = pd.DataFrame(
+        {"Weight Range": labels, "Frequency": counts.astype(int).values}
+    )
+
+    fig = px.bar(
+        frequency_df,
+        x="Weight Range",
+        y="Frequency",
+        category_orders={"Weight Range": labels},
+        color_discrete_sequence=["#5b9bd5"],
+        text="Frequency",
+    )
+    fig.update_traces(
+        marker_line_color="white",
+        marker_line_width=0.8,
+        textposition="outside",
+        hovertemplate="Weight range: %{x} mg<br>Frequency: %{y}<extra></extra>",
+    )
+    fig = apply_graph_style(
         fig,
         f"{batch_label} - Fill weight data",
-        "Nett Weight",
+        "Nett Weight Range (mg)",
         "Frequency",
         font_family,
         font_size,
     )
+    fig.update_xaxes(type="category", tickangle=0)
+    return fig
 
 
 # =====================================================
@@ -1500,7 +1560,7 @@ def combine_same_batch_reports(individual_results):
 
 
 def render_batch_analysis(
-    result, batch_key, lower_limit, upper_limit, histogram_bins,
+    result, batch_key, lower_limit, upper_limit, histogram_bin_width,
     show_x_grid, show_y_grid, show_range_slider, marker_size,
     marker_opacity, font_family, font_size, show_fill_limits,
     custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max,
@@ -1629,7 +1689,7 @@ def render_batch_analysis(
                                     key=f"fill_scatter_{batch_key}")
 
                     histogram = make_fill_histogram(
-                        graph_df, scatter_label, histogram_bins, font_family, font_size
+                        graph_df, scatter_label, histogram_bin_width, font_family, font_size
                     )
                     histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
                     st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
@@ -1747,7 +1807,14 @@ x_axis_min = st.sidebar.number_input("X-axis minimum", value=1.0, disabled=not c
 x_axis_max = st.sidebar.number_input("X-axis maximum", value=1000.0, disabled=not custom_axis_range)
 y_axis_min = st.sidebar.number_input("Y-axis minimum", value=520.0, disabled=not custom_axis_range)
 y_axis_max = st.sidebar.number_input("Y-axis maximum", value=545.0, disabled=not custom_axis_range)
-histogram_bins = st.sidebar.slider("Histogram bins", 5, 60, 20)
+histogram_bin_width = st.sidebar.number_input(
+    "Histogram weight interval (mg)",
+    min_value=0.5,
+    max_value=20.0,
+    value=5.0,
+    step=0.5,
+    help="Example: 5 mg displays ranges such as 525-530, 530-535, and 535-540.",
+)
 show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
 show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
 range_slider_mode = st.sidebar.selectbox(
@@ -1902,4 +1969,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-28-v29-compact-title-summary-legend")
+    st.caption("Parser version: 2026-10-28-v30-histogram-range-labels")
