@@ -1871,3 +1871,4 @@ with st.expander("Multi-batch extraction summary"):
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
     st.caption("Parser version: 2026-10-27-v26-compact-bold-pfs-summary")
+
