@@ -983,7 +983,11 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
         mirror=True,
         ticks="outside",
         tickcolor="#000000",
-        tickfont=dict(color="#000000"),
+        tickfont=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
         title_font=dict(family=font_family, size=font_size, color="#000000"),
         zeroline=False,
     )
@@ -998,7 +1002,11 @@ def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman
         mirror=True,
         ticks="outside",
         tickcolor="#000000",
-        tickfont=dict(color="#000000"),
+        tickfont=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
         title_font=dict(family=font_family, size=font_size, color="#000000"),
         zeroline=False,
     )
@@ -1172,7 +1180,39 @@ def make_fill_histogram(
         font_family,
         font_size,
     )
-    fig.update_xaxes(type="category", tickangle=0)
+    fig.update_xaxes(
+        type="category",
+        tickangle=0,
+        tickfont=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
+        title_font=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
+    )
+    fig.update_yaxes(
+        tickfont=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
+        title_font=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        ),
+    )
+    fig.update_traces(
+        textfont=dict(
+            family=font_family,
+            size=font_size,
+            color="#000000",
+        )
+    )
     return fig
 
 
@@ -1969,4 +2009,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-28-v30-histogram-range-labels")
+    st.caption("Parser version: 2026-10-28-v31-histogram-font-scaling")
