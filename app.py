@@ -930,7 +930,7 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
 
     fig.add_annotation(
         x=0.5,
-        y=1.10,
+        y=1.15,
         xref="paper",
         yref="paper",
         text=summary_text,
@@ -944,7 +944,7 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
             color="#000000",
         ),
     )
-    fig.update_layout(margin=dict(l=60, r=30, t=155, b=60))
+    fig.update_layout(margin=dict(l=70, r=40, t=210, b=75))
     return fig
 
 
@@ -1033,7 +1033,7 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
             orientation="h",
             x=0.5,
             xanchor="center",
-            y=1.02,
+            y=1.065,
             yanchor="bottom",
             font=dict(
                 family=font_family,
@@ -1075,14 +1075,27 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
     if show_limits:
         fig.update_layout(shapes=limit_shapes, annotations=limit_annotations)
 
-    return apply_graph_style(
+    fig = apply_graph_style(
         fig,
         f"{batch_label} - Fill weight data",
-        "Sample Number",
+        "Number of PFS",
         "Nett Weight",
         font_family,
         font_size,
     )
+    # Reserve separate rows for title, PFS quantity summary, and horizontal legend.
+    fig.update_layout(
+        title=dict(
+            text=f"{batch_label} - Fill weight data",
+            x=0.5,
+            xanchor="center",
+            y=0.985,
+            yanchor="top",
+            pad=dict(t=0, b=0),
+        ),
+        margin=dict(l=70, r=40, t=210, b=75),
+    )
+    return fig
 
 
 def make_fill_histogram(fill_pass_df, batch_label, bins, font_family="Times New Roman", font_size=12):
@@ -1889,4 +1902,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-28-v27-horizontal-scatter-legend")
+    st.caption("Parser version: 2026-10-28-v28-separated-header-number-of-pfs")
