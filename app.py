@@ -1932,7 +1932,7 @@ try:
         batch_key,
         lower_limit,
         upper_limit,
-        histogram_bins,
+        histogram_bin_width,
         show_x_grid,
         show_y_grid,
         show_range_slider,
