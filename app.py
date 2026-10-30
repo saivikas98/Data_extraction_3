@@ -25,7 +25,7 @@ st.set_page_config(
     layout="wide",
 )
 
-ANALYSIS_SCHEMA_VERSION = "2026-10-30-active-recipe-strength-v2"
+ANALYSIS_SCHEMA_VERSION = "2026-10-30-clean-editable-batch-label-v3"
 
 PUMP_COLOR_MAP = {
     "Pump 1": "#1f77b4",
@@ -894,7 +894,9 @@ def create_strength_classification_summary(results):
         passed_count = len(result.get("fill_pass", pd.DataFrame()))
         rows.append(
             {
-                "Batch": normalize_space(result.get("batch_label", "")),
+                "Batch": clean_batch_display_name(
+                    result.get("batch_label", "")
+                ),
                 "Active Recipe": active_recipe,
                 "Product Name": product_name,
                 "Mapped Strength (mg)": strength,
@@ -921,7 +923,9 @@ def create_batch_pump_statistics_for_charts(results):
         strength = extract_strength_mg(result.get("summary", pd.DataFrame()))
         if strength is None:
             continue
-        batch = normalize_space(result.get("batch_label", ""))
+        batch = clean_batch_display_name(
+            result.get("batch_label", "")
+        )
 
         def append_statistics(pump_label, values):
             values = pd.to_numeric(values, errors="coerce").dropna()
@@ -1214,7 +1218,7 @@ def get_pfs_quantity_summary(production_df, fill_df):
 
 
 def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
-    """Add one compact, bold PFS quantity summary below the graph title."""
+    """Place the bold PFS quantities in the Plotly subtitle position."""
     filled = int(quantities.get("Total Filled PFS", 0))
     accepted = int(quantities.get("Total Accepted PFS", 0))
     rejected = int(quantities.get("Total Rejected PFS", 0))
@@ -1227,23 +1231,32 @@ def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
         f"<b>Total Rejected PFS: {rejected:,}</b>"
     )
 
-    fig.add_annotation(
-        x=0.5,
-        y=1.095,
-        xref="paper",
-        yref="paper",
-        text=summary_text,
-        showarrow=False,
-        align="center",
-        xanchor="center",
-        yanchor="middle",
-        font=dict(
-            family=font_family,
-            size=max(int(font_size), 12),
-            color="#000000",
+    # Use Plotly's real subtitle field. This removes the editable placeholder
+    # "Click to enter Plot subtitle" and puts the production quantities there.
+    current_title = fig.layout.title.text or ""
+    fig.update_layout(
+        title=dict(
+            text=current_title,
+            x=0.5,
+            xanchor="center",
+            y=0.985,
+            yanchor="top",
+            font=dict(
+                family=font_family,
+                size=max(int(font_size) + 8, 18),
+                color="#000000",
+            ),
+            subtitle=dict(
+                text=summary_text,
+                font=dict(
+                    family=font_family,
+                    size=max(int(font_size), 12),
+                    color="#000000",
+                ),
+            ),
         ),
+        margin=dict(l=70, r=40, t=175, b=75),
     )
-    fig.update_layout(margin=dict(l=70, r=40, t=170, b=75))
     return fig
 
 
@@ -1340,7 +1353,7 @@ def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_
             orientation="h",
             x=0.5,
             xanchor="center",
-            y=1.035,
+            y=1.005,
             yanchor="bottom",
             font=dict(
                 family=font_family,
@@ -1709,6 +1722,17 @@ def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, fon
 # =====================================================
 # MULTI-BATCH ANALYSIS
 # =====================================================
+def clean_batch_display_name(value):
+    """Return concise batch ID, e.g. EG26058(...timestamp...) -> EG26058."""
+    text = normalize_space(value)
+    match = re.search(r"(?i)\b(EG\d+)\b", text)
+    if match:
+        return match.group(1).upper()
+    # Generic fallback removes timestamp/details in parentheses.
+    compact = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    return compact or text
+
+
 def safe_file_stem(name):
     stem = str(name).rsplit(".", 1)[0]
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
@@ -1743,7 +1767,9 @@ def analyze_batch_report(pdf_bytes, source_name):
     batch_number = ""
     if not summary_df.empty:
         batch_number = normalize_space(summary_df.iloc[0].get("Batch Number", ""))
-    batch_label = batch_number or safe_file_stem(source_name)
+    batch_label = clean_batch_display_name(
+        batch_number or safe_file_stem(source_name)
+    )
     page_count = len(pages)
 
     # Retain the originating report for full traceability after multiple reports
@@ -1778,7 +1804,7 @@ def analyze_batch_report(pdf_bytes, source_name):
 
 def report_root_batch(batch_label):
     """Return root batch, e.g. EG26051-1 -> EG26051."""
-    value = normalize_space(batch_label)
+    value = clean_batch_display_name(batch_label)
     match = re.fullmatch(r"(.+?)-(\d+)", value)
     return match.group(1) if match else value
 
@@ -2064,6 +2090,28 @@ def render_batch_analysis(
         )
         st.dataframe(classification_df, use_container_width=True, hide_index=True)
         comparison_df = create_batch_pump_statistics_for_charts(comparison_results)
+
+        if not comparison_df.empty:
+            st.subheader("Editable Batch Labels for Graph Axis")
+            st.caption(
+                "Batch labels are simplified automatically, for example "
+                "EG26058(2026-08-02_22-31-32) becomes EG26058. "
+                "Edit any label below if another report format needs correction."
+            )
+            original_batches = comparison_df["Batch"].drop_duplicates().tolist()
+            edited_batch_labels = {}
+            label_columns = st.columns(min(3, max(1, len(original_batches))))
+            for label_index, original_batch in enumerate(original_batches):
+                default_label = clean_batch_display_name(original_batch)
+                with label_columns[label_index % len(label_columns)]:
+                    edited_batch_labels[original_batch] = st.text_input(
+                        f"Axis label for {original_batch}",
+                        value=default_label,
+                        key=f"cross_batch_axis_label_{label_index}_{safe_file_stem(original_batch)}",
+                    ).strip() or default_label
+            comparison_df["Batch"] = comparison_df["Batch"].map(
+                edited_batch_labels
+            ).fillna(comparison_df["Batch"])
         if comparison_df.empty:
             st.warning(
                 "Cross-batch graphs require passed fill-weight data and a product "
@@ -2429,4 +2477,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-30-v34-active-recipe-session-refresh")
+    st.caption("Parser version: 2026-10-30-v36-clean-editable-batch-labels")
