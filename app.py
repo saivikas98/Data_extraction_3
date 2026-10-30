@@ -25,6 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
+ANALYSIS_SCHEMA_VERSION = "2026-10-30-active-recipe-strength-v2"
+
 PUMP_COLOR_MAP = {
     "Pump 1": "#1f77b4",
     "Pump 2": "#ff7f0e",
@@ -198,6 +200,13 @@ def extract_batch_summary(text):
             [
                 r"Filling\s*Skid\s*Recipe\s*Name\s*:?\s*(.*?)\s*(?:\n|$)",
                 r"Recipe\s*Name\s*:\s*(.*?)\s*(?:\n|$)",
+            ],
+        ),
+        "Active Recipe": find_first(
+            text,
+            [
+                r"Active\s*Recipe\s*:\s*(?:\n\s*)?([0-9]+(?:[.,][0-9]+)?)\s*ml\b",
+                r"Active\s*Recipe\s*:\s*(.*?)\s*(?:Running\s*Timers|\n)",
             ],
         ),
     }
@@ -828,19 +837,78 @@ def create_uploaded_batches_statistics(results):
 # CROSS-BATCH STRENGTH COMPARISON
 # =====================================================
 def extract_strength_mg(summary_df):
-    """Extract product strength in mg from Product Name / Recipe Name / Batch Size."""
+    """Determine strength using Active Recipe, then product-text fallback.
+
+    Approved mapping:
+        0.5 mL -> 120 mg
+        0.3 mL -> 90 mg
+        0.2 mL -> 60 mg
+    """
     if summary_df is None or summary_df.empty:
         return None
+
     row = summary_df.iloc[0]
+    active_recipe = normalize_space(row.get("Active Recipe", ""))
+    recipe_match = re.search(
+        r"(?i)([0-9]+(?:[.,][0-9]+)?)\s*(?:ml)?",
+        active_recipe,
+    )
+    if recipe_match:
+        recipe_volume = float(recipe_match.group(1).replace(",", "."))
+        volume_strength_map = {
+            0.5: 120,
+            0.3: 90,
+            0.2: 60,
+        }
+        for volume, strength in volume_strength_map.items():
+            if abs(recipe_volume - volume) < 0.0001:
+                return strength
+
+    # Fallback for reports where Active Recipe is unavailable. The lookahead
+    # accepts spaces, underscores, slashes, or end-of-text after "mg".
     searchable = " ".join(
         normalize_space(row.get(column, ""))
         for column in ["Product Name", "Recipe Name", "Batch Size"]
     )
-    match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*mg\b", searchable)
+    match = re.search(
+        r"(?i)(\d+(?:[.,]\d+)?)\s*mg(?=[^A-Za-z]|$)",
+        searchable,
+    )
     if not match:
         return None
-    value = float(match.group(1))
+    value = float(match.group(1).replace(",", "."))
     return int(value) if value.is_integer() else value
+
+
+def create_strength_classification_summary(results):
+    """Show how every uploaded/merged batch was classified for cross-batch charts."""
+    rows = []
+    for result in results:
+        summary = result.get("summary", pd.DataFrame())
+        active_recipe = ""
+        product_name = ""
+        if summary is not None and not summary.empty:
+            active_recipe = normalize_space(summary.iloc[0].get("Active Recipe", ""))
+            product_name = normalize_space(summary.iloc[0].get("Product Name", ""))
+        strength = extract_strength_mg(summary)
+        passed_count = len(result.get("fill_pass", pd.DataFrame()))
+        rows.append(
+            {
+                "Batch": normalize_space(result.get("batch_label", "")),
+                "Active Recipe": active_recipe,
+                "Product Name": product_name,
+                "Mapped Strength (mg)": strength,
+                "Passed Fill Records": passed_count,
+                "Cross-Batch Status": (
+                    "Included"
+                    if strength is not None and passed_count > 0
+                    else "Excluded: strength not mapped"
+                    if strength is None
+                    else "Excluded: no passed fill records"
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def create_batch_pump_statistics_for_charts(results):
@@ -867,6 +935,9 @@ def create_batch_pump_statistics_for_charts(results):
                 {
                     "Batch": batch,
                     "Strength": strength,
+                    "Active Recipe": normalize_space(
+                        result.get("summary", pd.DataFrame()).iloc[0].get("Active Recipe", "")
+                    ) if not result.get("summary", pd.DataFrame()).empty else "",
                     "Pump": pump_label,
                     "Sample Count": count,
                     "Average": mean_value,
@@ -1777,6 +1848,12 @@ def combine_same_batch_reports(individual_results):
         summary_rows = [part["summary"].iloc[0].to_dict() for part in parts if not part["summary"].empty]
         consolidated = summary_rows[0].copy() if summary_rows else {"Batch Number": group_key}
         consolidated["Batch Number"] = group_key
+        if not normalize_space(consolidated.get("Active Recipe", "")):
+            for source_row in summary_rows:
+                active_recipe_value = normalize_space(source_row.get("Active Recipe", ""))
+                if active_recipe_value:
+                    consolidated["Active Recipe"] = active_recipe_value
+                    break
         consolidated["Combined Report Count"] = len(parts)
         consolidated["Source Reports"] = "; ".join(source_names)
 
@@ -1979,6 +2056,13 @@ def render_batch_analysis(
 
     elif section == "Cross-Batch Statistics":
         comparison_results = all_results if all_results is not None else [result]
+        classification_df = create_strength_classification_summary(comparison_results)
+        st.subheader("Batch Strength Classification")
+        st.caption(
+            "Active Recipe mapping used first: 0.5 mL = 120 mg, "
+            "0.3 mL = 90 mg, 0.2 mL = 60 mg. Product Name is only a fallback."
+        )
+        st.dataframe(classification_df, use_container_width=True, hide_index=True)
         comparison_df = create_batch_pump_statistics_for_charts(comparison_results)
         if comparison_df.empty:
             st.warning(
@@ -1988,7 +2072,8 @@ def render_batch_analysis(
         else:
             st.subheader("Cross-Batch Pump Statistics by Strength")
             st.caption(
-                "Charts use records where Weight Passed = 1. "
+                "Charts use records where Weight Passed = 1. Strength is assigned from "
+                "Active Recipe: 0.5 mL = 120 mg, 0.3 mL = 90 mg, and 0.2 mL = 60 mg. "
                 "All Pumps Combined is shown as a dashed black line with diamond markers."
             )
             selected_strengths = st.multiselect(
@@ -2141,6 +2226,14 @@ st.info(
     "Memory-safe mode: PDF page text and coordinate data are released immediately "
     "after structured extraction. Streamlit data caching is disabled."
 )
+# Invalidate structured results produced by older app versions that did not
+# extract Active Recipe. Otherwise Streamlit session state can retain the older
+# summaries and the cross-batch charts will continue to show only one batch.
+if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
+    st.session_state.pop("analysis_results", None)
+    st.session_state.pop("uploaded_report_count", None)
+    st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
+
 if st.sidebar.button("Clear App Data and Cache", type="primary", use_container_width=True):
     try:
         st.cache_data.clear()
@@ -2236,6 +2329,7 @@ if analyze_clicked:
         results = combine_same_batch_reports(results)
         st.session_state["analysis_results"] = results
         st.session_state["uploaded_report_count"] = uploaded_report_count
+        st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
     else:
         st.error("None of the uploaded reports could be processed.")
 
@@ -2335,4 +2429,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-30-v32-cross-batch-strength-charts")
+    st.caption("Parser version: 2026-10-30-v34-active-recipe-session-refresh")
