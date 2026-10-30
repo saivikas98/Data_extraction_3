@@ -7,6 +7,8 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 try:
@@ -823,6 +825,230 @@ def create_uploaded_batches_statistics(results):
 
 
 # =====================================================
+# CROSS-BATCH STRENGTH COMPARISON
+# =====================================================
+def extract_strength_mg(summary_df):
+    """Extract product strength in mg from Product Name / Recipe Name / Batch Size."""
+    if summary_df is None or summary_df.empty:
+        return None
+    row = summary_df.iloc[0]
+    searchable = " ".join(
+        normalize_space(row.get(column, ""))
+        for column in ["Product Name", "Recipe Name", "Batch Size"]
+    )
+    match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*mg\b", searchable)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return int(value) if value.is_integer() else value
+
+
+def create_batch_pump_statistics_for_charts(results):
+    """Create one row per batch/pump plus an all-pumps row for comparison charts."""
+    rows = []
+    for result in results:
+        passed = result.get("fill_pass", pd.DataFrame())
+        if passed is None or passed.empty:
+            continue
+        strength = extract_strength_mg(result.get("summary", pd.DataFrame()))
+        if strength is None:
+            continue
+        batch = normalize_space(result.get("batch_label", ""))
+
+        def append_statistics(pump_label, values):
+            values = pd.to_numeric(values, errors="coerce").dropna()
+            count = int(values.count())
+            if count == 0:
+                return
+            mean_value = float(values.mean())
+            sd_value = float(values.std(ddof=1)) if count > 1 else 0.0
+            rsd_value = (sd_value / mean_value * 100.0) if mean_value else 0.0
+            rows.append(
+                {
+                    "Batch": batch,
+                    "Strength": strength,
+                    "Pump": pump_label,
+                    "Sample Count": count,
+                    "Average": mean_value,
+                    "Standard Deviation": sd_value,
+                    "RSD (%)": rsd_value,
+                }
+            )
+
+        for position in sorted(passed["Position"].dropna().unique().tolist()):
+            append_statistics(
+                f"Pump {int(position)}",
+                passed.loc[passed["Position"].eq(position), "Nett Weight"],
+            )
+        append_statistics("All Pumps Combined", passed["Nett Weight"])
+
+    return pd.DataFrame(rows)
+
+
+def make_strength_comparison_chart(
+    chart_df,
+    metric,
+    title,
+    y_axis_title,
+    font_family="Times New Roman",
+    font_size=12,
+):
+    """Create interactive vertically stacked strength subplots."""
+    if chart_df is None or chart_df.empty or metric not in chart_df.columns:
+        return None
+
+    strengths = sorted(chart_df["Strength"].dropna().unique().tolist(), reverse=True)
+    if not strengths:
+        return None
+
+    pump_order = [
+        "Pump 1", "Pump 2", "Pump 3", "Pump 4", "All Pumps Combined"
+    ]
+    color_map = {
+        "Pump 1": "#0072BD",
+        "Pump 2": "#E69F00",
+        "Pump 3": "#009E73",
+        "Pump 4": "#CC79A7",
+        "All Pumps Combined": "#000000",
+    }
+    dash_map = {
+        "Pump 1": "solid",
+        "Pump 2": "solid",
+        "Pump 3": "solid",
+        "Pump 4": "solid",
+        "All Pumps Combined": "dash",
+    }
+    symbol_map = {
+        "Pump 1": "circle",
+        "Pump 2": "circle",
+        "Pump 3": "circle",
+        "Pump 4": "circle",
+        "All Pumps Combined": "diamond",
+    }
+
+    figure = make_subplots(
+        rows=len(strengths),
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.10 if len(strengths) <= 3 else 0.07,
+        subplot_titles=[f"{strength:g} mg" for strength in strengths],
+    )
+
+    legend_seen = set()
+    for row_number, strength in enumerate(strengths, start=1):
+        strength_df = chart_df[chart_df["Strength"].eq(strength)].copy()
+        batch_order = strength_df["Batch"].drop_duplicates().tolist()
+        for pump in pump_order:
+            pump_df = strength_df[strength_df["Pump"].eq(pump)].copy()
+            if pump_df.empty:
+                continue
+            pump_df["Batch"] = pd.Categorical(
+                pump_df["Batch"], categories=batch_order, ordered=True
+            )
+            pump_df = pump_df.sort_values("Batch")
+            show_legend = pump not in legend_seen
+            legend_seen.add(pump)
+            is_combined = pump == "All Pumps Combined"
+            figure.add_trace(
+                go.Scatter(
+                    x=pump_df["Batch"].astype(str),
+                    y=pump_df[metric],
+                    mode="lines+markers+text" if is_combined else "lines+markers",
+                    name=pump,
+                    legendgroup=pump,
+                    showlegend=show_legend,
+                    line=dict(
+                        color=color_map[pump],
+                        width=2.2 if is_combined else 2.0,
+                        dash=dash_map[pump],
+                    ),
+                    marker=dict(
+                        color=color_map[pump],
+                        size=8 if is_combined else 7,
+                        symbol=symbol_map[pump],
+                    ),
+                    text=[f"{value:.2f}" for value in pump_df[metric]] if is_combined else None,
+                    textposition="top center",
+                    customdata=np.column_stack(
+                        [pump_df["Sample Count"], pump_df["Strength"]]
+                    ),
+                    hovertemplate=(
+                        "Batch: %{x}<br>"
+                        + f"{y_axis_title}: %{{y:.3f}}<br>"
+                        + "Samples: %{customdata[0]}<br>"
+                        + "Strength: %{customdata[1]:g} mg<extra>"
+                        + pump
+                        + "</extra>"
+                    ),
+                ),
+                row=row_number,
+                col=1,
+            )
+
+    figure.update_layout(
+        title=dict(
+            text=title,
+            x=0.5,
+            xanchor="center",
+            font=dict(
+                family=font_family,
+                size=max(int(font_size) + 8, 18),
+                color="#000000",
+            ),
+        ),
+        legend=dict(
+            orientation="h",
+            x=0.5,
+            xanchor="center",
+            y=1.04,
+            yanchor="bottom",
+            font=dict(family=font_family, size=font_size, color="#000000"),
+        ),
+        template="plotly_white",
+        height=max(360 * len(strengths), 520),
+        margin=dict(l=80, r=40, t=140, b=70),
+        hovermode="closest",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(family=font_family, size=font_size, color="#000000"),
+    )
+
+    for row_number in range(1, len(strengths) + 1):
+        figure.update_xaxes(
+            title_text="Batch Number" if row_number == len(strengths) else "",
+            showgrid=True,
+            gridcolor="#e0e0e0",
+            linecolor="#000000",
+            linewidth=1.5,
+            mirror=True,
+            tickfont=dict(family=font_family, size=font_size, color="#000000"),
+            title_font=dict(family=font_family, size=font_size, color="#000000"),
+            row=row_number,
+            col=1,
+        )
+        figure.update_yaxes(
+            title_text=y_axis_title,
+            showgrid=True,
+            gridcolor="#e0e0e0",
+            linecolor="#000000",
+            linewidth=1.5,
+            mirror=True,
+            tickfont=dict(family=font_family, size=font_size, color="#000000"),
+            title_font=dict(family=font_family, size=font_size, color="#000000"),
+            row=row_number,
+            col=1,
+        )
+
+    for annotation in figure.layout.annotations:
+        annotation.font = dict(
+            family=font_family,
+            size=max(int(font_size) + 2, 14),
+            color="#000000",
+        )
+    return figure
+
+
+# =====================================================
 # SUMMARIES
 # =====================================================
 def create_alarm_summary(alarm_df):
@@ -1604,6 +1830,7 @@ def render_batch_analysis(
     show_x_grid, show_y_grid, show_range_slider, marker_size,
     marker_opacity, font_family, font_size, show_fill_limits,
     custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max,
+    all_results=None,
 ):
     """Render only the selected section to keep Streamlit Cloud memory stable."""
     batch_label = result["batch_label"]
@@ -1624,7 +1851,7 @@ def render_batch_analysis(
 
     section = st.radio(
         "Analysis section",
-        ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail", "Downloads"],
+        ["Summary", "Production", "Fill Weight", "Cross-Batch Statistics", "All Alarms", "Audit Trail", "Downloads"],
         horizontal=True,
         key=f"section_{batch_key}",
     )
@@ -1749,6 +1976,104 @@ def render_batch_analysis(
                             mime="text/html", key=f"html_download_{batch_key}",
                             use_container_width=True,
                         )
+
+    elif section == "Cross-Batch Statistics":
+        comparison_results = all_results if all_results is not None else [result]
+        comparison_df = create_batch_pump_statistics_for_charts(comparison_results)
+        if comparison_df.empty:
+            st.warning(
+                "Cross-batch graphs require passed fill-weight data and a product "
+                "strength such as 60 mg, 90 mg, or 120 mg in the batch summary."
+            )
+        else:
+            st.subheader("Cross-Batch Pump Statistics by Strength")
+            st.caption(
+                "Charts use records where Weight Passed = 1. "
+                "All Pumps Combined is shown as a dashed black line with diamond markers."
+            )
+            selected_strengths = st.multiselect(
+                "Strengths to display",
+                options=sorted(
+                    comparison_df["Strength"].dropna().unique().tolist(),
+                    reverse=True,
+                ),
+                default=sorted(
+                    comparison_df["Strength"].dropna().unique().tolist(),
+                    reverse=True,
+                ),
+                key="cross_batch_strength_filter",
+            )
+            filtered_comparison_df = comparison_df[
+                comparison_df["Strength"].isin(selected_strengths)
+            ].copy()
+
+            chart_choice = st.multiselect(
+                "Graphs to display",
+                options=["Mean", "Standard Deviation", "RSD (%)"],
+                default=["Mean", "Standard Deviation", "RSD (%)"],
+                key="cross_batch_chart_filter",
+            )
+            chart_specs = [
+                (
+                    "Mean",
+                    "Average",
+                    "Mean by Batch, Pump and Strength",
+                    "Average Fill Weight (mg)",
+                    "mean_by_batch_pump_strength",
+                ),
+                (
+                    "Standard Deviation",
+                    "Standard Deviation",
+                    "Standard Deviation by Batch, Pump and Strength",
+                    "Standard Deviation (mg)",
+                    "sd_by_batch_pump_strength",
+                ),
+                (
+                    "RSD (%)",
+                    "RSD (%)",
+                    "Relative Standard Deviation by Batch, Pump and Strength",
+                    "RSD (%)",
+                    "rsd_by_batch_pump_strength",
+                ),
+            ]
+
+            for choice_label, metric, title, y_title, download_name in chart_specs:
+                if choice_label not in chart_choice:
+                    continue
+                chart = make_strength_comparison_chart(
+                    filtered_comparison_df,
+                    metric,
+                    title,
+                    y_title,
+                    font_family,
+                    font_size,
+                )
+                if chart is None:
+                    continue
+                st.plotly_chart(
+                    chart,
+                    use_container_width=True,
+                    config=PLOTLY_CONFIG,
+                    key=f"{download_name}_{batch_key}",
+                )
+                st.download_button(
+                    f"Download {choice_label} Chart as Interactive HTML",
+                    data=figure_to_html_bytes(chart),
+                    file_name=f"{download_name}.html",
+                    mime="text/html",
+                    key=f"download_{download_name}_{batch_key}",
+                    use_container_width=True,
+                )
+
+            st.subheader("Statistics Used for Cross-Batch Charts")
+            st.dataframe(
+                filtered_comparison_df.sort_values(
+                    ["Strength", "Batch", "Pump"],
+                    ascending=[False, True, True],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     elif section == "All Alarms":
         if all_alarms_df.empty:
@@ -1986,6 +2311,7 @@ try:
         x_axis_max,
         y_axis_min,
         y_axis_max,
+        results,
     )
 except Exception as display_error:
     st.error("The selected batch dashboard could not be rendered.")
@@ -2009,4 +2335,4 @@ with st.expander("Multi-batch extraction summary"):
             "PDF Pages": result.get("page_count", 0),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-28-v31-histogram-font-scaling")
+    st.caption("Parser version: 2026-10-30-v32-cross-batch-strength-charts")
